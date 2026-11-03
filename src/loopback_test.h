@@ -16,7 +16,7 @@
 
 namespace loopback {
 
-// Stopped: 사용자 중지로 시험 시간 미완료, 실패 없음. 판정 보류.
+// Stopped: 사용자 중지로 시험 시간 미완료, 이상 없음. 판정 보류
 enum class Verdict { Pending, Ok, Fail, Stopped };
 
 struct TestSettings {
@@ -42,38 +42,39 @@ struct TestSnapshot {
     std::chrono::microseconds meanLatency{0};
     std::chrono::milliseconds elapsed{0};
     std::chrono::seconds duration{0};
-    std::chrono::milliseconds echoTimeout{0};
     bool hasFailure = false;
     std::chrono::milliseconds firstFailureAt{0};
     std::wstring firstFailure;
     std::wstring abortReason;  // 송·수신 치명 오류로 인한 시험 중단 사유
-    std::vector<bool> recent;  // 최근 판정 이력(과거 → 최근). true: 정상 회신
+    std::vector<std::uint8_t> timeline;  // 시험 시간 균등 분할 구간별 판정. 0 미도래, 1 정상, 2 이상
 };
 
-// 반송 시험 러너. 작업 스레드 1개가 송·수신 처리.
-// 송신 전문별 판정: 동일 DATA 회신 시 정상, echoTimeout 초과 시 실패.
-// 수신 이상(전문 불량·대응 없는 전문·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 실패.
-// 회신 대조는 미회신 대기열 전체 탐색 방식으로 1건 손실 시 후속 전문 연쇄 오판 방지.
-// 시간 초과 판정 후 도착한 회신은 지연 회신으로 기록만 하고 중복 계수 제외. 회신 완료 전문 재수신은 중복 회신 실패.
-// RS-485 2선식 반향 미발생 설정에서 전문 선로 시간 2배 미만 사본은 자기 송신 반향으로 판정(실패 계수 후 반향 제거 전환).
+// 채널별 반송 시험 엔진. 작업 스레드 1개가 송·수신 처리
+// 송신 전문별 판정: 동일 DATA 회신 시 정상, echoTimeout 초과 시 이상
+// 수신 이상(전문 불량·대응 없는 전문·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 이상
+// 회신 대조는 미회신 대기열 전체 탐색. 1건 손실 시 후속 전문 연쇄 오판 방지
+// 시간 초과 판정 후 도착 회신은 지연 회신 기록만 수행, 중복 계수 제외. 회신 완료 전문 재수신은 중복 회신 이상
+// RS-485 2선식 송신 반향 미발생 설정: 전문 선로 시간 1.5배(송·회신 합의 75%) 미만 사본 또는 송신 중 수신은
+// 송신 반향으로 판정(이상 계수 후 반향 제거 전환)
 class LoopbackTest {
 public:
-    static constexpr std::size_t recentCapacity = 80;
-    static constexpr std::size_t expiredCapacity = 4096;  // 지연 회신 판별 이력. 50ms 주기 약 200s분
-    static constexpr std::size_t answeredCapacity = 256;  // 중복 회신 판별 이력. 50ms 주기 약 12.8s분
+    static constexpr std::size_t timelineSlots = 96;       // 판정 추이 구간 수. 시험 시간 균등 분할
+    static constexpr std::size_t expiredCapacity = 4096;   // 지연 회신 판별 이력. 50ms 주기 약 200s분
+    static constexpr std::size_t answeredCapacity = 4096;  // 중복 회신 판별 이력. 50ms 주기 약 200s분
     static constexpr std::size_t failureLogLimit = 100;
     static constexpr std::size_t eventQueueLimit = 1000;
-    static constexpr std::chrono::minutes summaryInterval{10};  // 상세 기록 상한 도달 후 요약 주기
+    static constexpr std::chrono::minutes summaryInterval{10};      // 상세 기록 상한 도달 후 요약 주기
+    static constexpr std::chrono::milliseconds idleWait{100};       // 수신 대기 상한. 통상 대기는 다음 송신 주기까지
 
     LoopbackTest();
     ~LoopbackTest();
     LoopbackTest(const LoopbackTest&) = delete;
     LoopbackTest& operator=(const LoopbackTest&) = delete;
 
-    // open: 전송로 개방만 수행. 채널 간 병렬 호출 허용. begin: 작업 스레드 기동
+    // open: 전송로 개방만 수행. 채널 간 병렬 호출 허용
+    // begin: 작업 스레드 기동. lane: 논리 프로세서 분산 배치 순번(채널 번호)
     bool open(const TestSettings& settings, std::wstring& error);
-    void begin();
-    bool start(const TestSettings& settings, std::wstring& error);
+    void begin(std::size_t lane);
     // cancel: 중지 신호만 전달. stop: 작업 스레드 종료 대기 후 전송로 폐쇄
     void cancel();
     void stop();
@@ -93,6 +94,20 @@ private:
         bool localEchoSeen = false;
     };
 
+    // 고정 용량 판정 이력. 용량 초과 시 최고(最古) 항목 덮어쓰기, 시험 중 추가 할당 없음
+    // seq 0 항목은 소비 완료분으로 탐색 제외
+    class History {
+    public:
+        void reset(std::size_t capacity);
+        void push(const Outstanding& item);
+        Outstanding* find(const Data& data);  // 최신 항목 우선
+
+    private:
+        std::vector<Outstanding> items_;
+        std::size_t next_ = 0;
+        std::size_t size_ = 0;
+    };
+
     void run();
     void finish(const std::wstring& abortReason);
 
@@ -101,11 +116,11 @@ private:
     void expire(Clock::time_point now);
     void fail(std::uint64_t seq, const std::wstring& text, Clock::time_point at, bool log = true,
               std::uint64_t count = 1);
-    void pass(Clock::duration latency);
+    void pass(Clock::duration latency, Clock::time_point at);
     void detail(const std::wstring& text, Clock::time_point at);
     void summarize(Clock::time_point now);
     void note(std::wstring text);
-    void remember(bool ok);
+    void remember(bool ok, Clock::time_point at);
     std::chrono::milliseconds sinceStart(Clock::time_point at) const;
     // 반이중 선로 장치 회신 완료 하한: 송신·회신 전문 선로 시간 합의 75% (통신 속도 오차 여유)
     Clock::duration replyFloor(std::size_t wireBytes) const;
@@ -117,20 +132,20 @@ private:
 
     mutable std::mutex mutex_;
     TestSnapshot state_{};
-    std::deque<Outstanding> pending_;
-    std::deque<Outstanding> expired_;
-    std::deque<Outstanding> answered_;
+    std::vector<Outstanding> pending_;  // 송신 순 미회신 전문. 회신 제한 구간분 용량 선확보
+    History expired_;
+    History answered_;
     std::deque<TestEvent> events_;
-    std::array<bool, recentCapacity> recent_{};
-    std::size_t recentCount_ = 0;
-    std::size_t recentNext_ = 0;
+    std::array<std::uint8_t, timelineSlots> timeline_{};
     std::uint64_t latencySumUs_ = 0;
     std::size_t loggedFailures_ = 0;
     std::uint64_t summarizedFailures_ = 0;
     Clock::time_point summarizedAt_{};
     bool completed_ = false;
 
-    Buffer rxBuffer_;
+    Buffer rxBuffer_;  // 수신 누적. 시험 시작 시 용량 선확보
+    Buffer txFrame_;   // 송신 전문. 주기마다 재사용
+    std::size_t lane_ = 0;
     Clock::time_point startedAt_{};
     bool halfDuplex_ = false;      // RS-485 2선식
     bool dropLocalEcho_ = false;   // 송신 전문당 최초 사본 판정 제외

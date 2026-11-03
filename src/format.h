@@ -30,6 +30,16 @@ inline std::wstring clockText(std::chrono::milliseconds value, bool millis = fal
     return buffer;
 }
 
+// 소수점 1자리 ms 표기
+template <typename Rep, typename Period>
+std::wstring msText(std::chrono::duration<Rep, Period> value)
+{
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(value).count();
+    wchar_t buffer[32]{};
+    std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%.1f ms", static_cast<double>(micros) / 1000.0);
+    return buffer;
+}
+
 inline std::wstring hexText(const std::uint8_t* data, std::size_t size)
 {
     static const wchar_t digits[] = L"0123456789ABCDEF";

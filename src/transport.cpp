@@ -23,6 +23,11 @@ namespace {
 
 constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스레드 정지 시간 제한
 constexpr DWORD kSendTimeoutMs    = 250;   // 전문 1건 송신 처리 상한. 송신 주기 50ms의 5배
+constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
+constexpr DWORD kByteGapMs        = 2;     // 직렬 수신 반환 조건: 바이트 간 공백 2ms
+constexpr int   kSocketBufferBytes = 262144;  // 소켓 수신 버퍼. 작업 스레드 지연 구간 데이터그램 보존
+constexpr std::size_t kReceiveBurstBytes = 65536;     // receive 1회 수용 상한. 연속 유입 시 송신 주기 처리 기회 보장
+constexpr std::size_t kReceiveBurstDatagrams = 1024;  // UDP receive 1회 수용 데이터그램 상한
 
 struct WinsockBoot {
     int status;
@@ -95,9 +100,44 @@ bool isLocalAddress(const in_addr& address)
     return local;
 }
 
+DWORD waitMilliseconds(std::chrono::milliseconds wait)
+{
+    if (wait <= std::chrono::milliseconds::zero()) return 0;
+    return static_cast<DWORD>((std::min)(wait, std::chrono::milliseconds(60000)).count());
+}
+
+// 소켓 수신 가능 또는 wait 경과까지 대기. 수신 버퍼 기존 데이터 존재 시 즉시 반환
+bool awaitReadable(SOCKET socket, std::chrono::milliseconds wait, const wchar_t* what, std::wstring& error)
+{
+    const DWORD waitMs = waitMilliseconds(wait);
+    if (!waitMs) return true;
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(socket, &readable);
+    timeval limit{static_cast<long>(waitMs / 1000), static_cast<long>(waitMs % 1000 * 1000)};
+    if (select(0, &readable, nullptr, nullptr, &limit) == SOCKET_ERROR) {
+        const long code = socketError();
+        error = failure(what, code);
+        return false;
+    }
+    return true;
+}
+
+// 수신 버퍼 확대. 실패 시 기본값 유지(비치명)
+void enlargeReceiveBuffer(SOCKET socket)
+{
+    const int bytes = kSocketBufferBytes;
+    setsockopt(socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+}
+
 class SerialTransport : public Transport {
 public:
-    explicit SerialTransport(const SerialConfig& config) : config_(config) {}
+    explicit SerialTransport(const SerialConfig& config) : config_(config)
+    {
+        const double stop = config.stopBits == ONESTOPBIT ? 1.0 : config.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
+        const double bits = 1.0 + config.dataBits + (config.parity != NOPARITY ? 1.0 : 0.0) + stop;
+        charMicros_ = config.baud ? bits * 1e6 / static_cast<double>(config.baud) : 0.0;
+    }
     ~SerialTransport() override { close(); }
 
     bool open(std::wstring& error) override
@@ -113,6 +153,8 @@ public:
             error = failure(config_.port + L" 열기 실패" + hint, code);
             return false;
         }
+
+        SetupComm(handle_, kSerialQueueBytes, kSerialQueueBytes);
 
         DCB dcb{};
         dcb.DCBlength = sizeof(dcb);
@@ -148,11 +190,6 @@ public:
         dcb.XonChar  = 0x11;
         dcb.XoffChar = 0x13;
 
-        // 읽기: 대기 없이 즉시 반환. 쓰기: 전문 1건 처리 상한 적용
-        COMMTIMEOUTS timeouts{};
-        timeouts.ReadIntervalTimeout = MAXDWORD;
-        timeouts.WriteTotalTimeoutConstant = kSendTimeoutMs;
-
         if (!SetCommState(handle_, &dcb)) {
             const long code = systemError();
             // RTS 토글 미지원 드라이버: 장치 자동 방향 제어 전제로 RTS 상시 활성 재시도
@@ -166,7 +203,8 @@ public:
         }
         // 설정 중 래치된 회선 오류 플래그 해제. 시험 개시 전 이상의 첫 판정 반영 방지
         DWORD stale = 0;
-        if (!SetCommTimeouts(handle_, &timeouts) || !PurgeComm(handle_, PURGE_RXCLEAR | PURGE_TXCLEAR) ||
+        readWaitMs_ = MAXDWORD;
+        if (!applyReadWait(0) || !PurgeComm(handle_, PURGE_RXCLEAR | PURGE_TXCLEAR) ||
             !ClearCommError(handle_, &stale, nullptr)) {
             const long code = systemError();
             error = failure(config_.port + L" 초기화 실패", code);
@@ -182,10 +220,13 @@ public:
         handle_ = INVALID_HANDLE_VALUE;
     }
 
-    bool isOpen() const override { return handle_ != INVALID_HANDLE_VALUE; }
-
     bool send(const Buffer& frame, std::wstring& error) override
     {
+        // RS-485 2선식: 송신 전후 수신 대기열 비교. 송신 완료 대기형 드라이버(WriteFile 소요 ≥ 전문 선로 시간 절반)에 한해 판정
+        const bool halfDuplex = config_.standard == SerialStandard::Rs485TwoWire;
+        DWORD before = 0;
+        if (halfDuplex && !queuedBytes(before, error)) return false;
+        const auto started = std::chrono::steady_clock::now();
         DWORD written = 0;
         if (!WriteFile(handle_, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr)) {
             const long code = systemError();
@@ -197,24 +238,32 @@ public:
                     L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
             return false;
         }
+        if (halfDuplex) {
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            DWORD after = 0;
+            if (!queuedBytes(after, error)) return false;
+            const auto halfWire =
+                std::chrono::duration<double, std::micro>(charMicros_ * static_cast<double>(frame.size()) * 0.5);
+            if (after > before && elapsed >= halfWire) sendEcho_ = true;
+        }
         return true;
     }
 
-    bool receive(Buffer& inOut, std::wstring& error) override
+    bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
-        DWORD errors = 0;
-        COMSTAT status{};
-        if (!ClearCommError(handle_, &errors, &status)) {
+        DWORD queued = 0;
+        if (!queuedBytes(queued, error)) return false;
+        const DWORD waitMs = queued ? 0 : waitMilliseconds(wait);
+        if (!queued && !waitMs) return true;
+        if (!applyReadWait(waitMs)) {
             const long code = systemError();
-            error = failure(L"회선 상태 조회 실패", code);
+            error = failure(L"직렬 수신 대기 설정 실패", code);
             return false;
         }
-        constexpr DWORD lineErrors = CE_FRAME | CE_OVERRUN | CE_RXPARITY | CE_RXOVER | CE_BREAK;
-        if (errors & lineErrors) addFault(lineFaultText(errors & lineErrors));
-        if (!status.cbInQue) return true;
 
-        std::array<Byte, 1024> chunk{};
-        const DWORD toRead = (std::min)(status.cbInQue, static_cast<DWORD>(chunk.size()));
+        std::array<Byte, 4096> chunk{};
+        const DWORD toRead = queued ? (std::min)(queued, static_cast<DWORD>(chunk.size()))
+                                    : static_cast<DWORD>(chunk.size());
         DWORD got = 0;
         if (!ReadFile(handle_, chunk.data(), toRead, &got, nullptr)) {
             const long code = systemError();
@@ -232,9 +281,46 @@ public:
         return taken;
     }
 
+    bool takeSendEcho() override
+    {
+        const bool echoed = sendEcho_;
+        sendEcho_ = false;
+        return echoed;
+    }
+
     std::wstring notice() const override { return notice_; }
 
 private:
+    // 수신 대기열 크기 조회. 래치된 회선 오류는 건별 이상으로 기록
+    bool queuedBytes(DWORD& bytes, std::wstring& error)
+    {
+        DWORD errors = 0;
+        COMSTAT status{};
+        if (!ClearCommError(handle_, &errors, &status)) {
+            const long code = systemError();
+            error = failure(L"회선 상태 조회 실패", code);
+            return false;
+        }
+        constexpr DWORD lineErrors = CE_FRAME | CE_OVERRUN | CE_RXPARITY | CE_RXOVER | CE_BREAK;
+        if (errors & lineErrors) addFault(lineFaultText(errors & lineErrors));
+        bytes = status.cbInQue;
+        return true;
+    }
+
+    // 수신 대기 방식. 0: 즉시 반환. 그 외: 첫 바이트 도착 후 바이트 간 공백 또는 대기 상한 경과 시 반환
+    // 쓰기 상한은 전문 1건 처리 상한 고정. 값 변경 시에만 SetCommTimeouts 호출
+    bool applyReadWait(DWORD waitMs)
+    {
+        if (waitMs == readWaitMs_) return true;
+        COMMTIMEOUTS timeouts{};
+        timeouts.ReadIntervalTimeout = waitMs ? kByteGapMs : MAXDWORD;
+        timeouts.ReadTotalTimeoutConstant = waitMs;
+        timeouts.WriteTotalTimeoutConstant = kSendTimeoutMs;
+        if (!SetCommTimeouts(handle_, &timeouts)) return false;
+        readWaitMs_ = waitMs;
+        return true;
+    }
+
     void addFault(std::wstring text)
     {
         if (!fault_.count) fault_.text = std::move(text);
@@ -243,12 +329,16 @@ private:
 
     static std::wstring lineFaultText(DWORD flags)
     {
-        std::wstring text = L"회선 이상:";
-        if (flags & CE_FRAME)    text += L" 프레이밍 오류";
-        if (flags & CE_RXPARITY) text += L" 패리티 오류";
-        if (flags & CE_OVERRUN)  text += L" 오버런";
-        if (flags & CE_RXOVER)   text += L" 수신 버퍼 초과";
-        if (flags & CE_BREAK)    text += L" 브레이크 신호";
+        std::wstring text;
+        const auto add = [&text](const wchar_t* item) {
+            text += text.empty() ? L"회선 이상: " : L"·";
+            text += item;
+        };
+        if (flags & CE_FRAME)    add(L"프레이밍 오류");
+        if (flags & CE_RXPARITY) add(L"패리티 오류");
+        if (flags & CE_OVERRUN)  add(L"오버런");
+        if (flags & CE_RXOVER)   add(L"수신 버퍼 초과");
+        if (flags & CE_BREAK)    add(L"브레이크 신호 수신");
         wchar_t code[16]{};
         std::swprintf(code, sizeof(code) / sizeof(code[0]), L" (0x%04lX)", static_cast<unsigned long>(flags));
         return text + code;
@@ -256,6 +346,9 @@ private:
 
     SerialConfig config_;
     HANDLE handle_ = INVALID_HANDLE_VALUE;
+    DWORD readWaitMs_ = MAXDWORD;
+    double charMicros_ = 0.0;  // 직렬 문자 1개 선로 시간(us)
+    bool sendEcho_ = false;
     LineFault fault_;
     std::wstring notice_;
 };
@@ -285,6 +378,7 @@ public:
             error = failure(L"TCP 소켓 생성 실패", code);
             return false;
         }
+        enlargeReceiveBuffer(socket_);
         u_long nonblocking = 1;
         BOOL noDelay = TRUE;  // 50ms 주기 소형 전문의 Nagle 지연 방지
         if (ioctlsocket(socket_, FIONBIO, &nonblocking) != 0 ||
@@ -301,7 +395,7 @@ public:
         }
         // 미개방 임시 포트 대상 접속 시 자기 자신과 연결되는 TCP 동시 개방 현상 차단
         if (selfConnected()) {
-            error = L"TCP 자기 접속 검출. 상대 포트 미개방 상태로 인터페이스 장치 미경유.";
+            error = L"TCP 자기 접속 검출. 상대 포트 미개방 상태로 인터페이스 장치 미경유. 상대 주소·포트 확인 필요.";
             close();
             return false;
         }
@@ -313,8 +407,6 @@ public:
         if (socket_ != INVALID_SOCKET) closesocket(socket_);
         socket_ = INVALID_SOCKET;
     }
-
-    bool isOpen() const override { return socket_ != INVALID_SOCKET; }
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
@@ -350,13 +442,15 @@ public:
         return true;
     }
 
-    bool receive(Buffer& inOut, std::wstring& error) override
+    bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
-        std::array<Byte, 2048> chunk{};
-        for (;;) {
+        if (!awaitReadable(socket_, wait, L"TCP 수신 대기 실패", error)) return false;
+        std::array<Byte, 4096> chunk{};
+        for (std::size_t taken = 0; taken < kReceiveBurstBytes;) {
             const int got = recv(socket_, reinterpret_cast<char*>(chunk.data()), static_cast<int>(chunk.size()), 0);
             if (got > 0) {
                 inOut.insert(inOut.end(), chunk.begin(), chunk.begin() + got);
+                taken += static_cast<std::size_t>(got);
                 continue;
             }
             if (got == 0) {
@@ -368,6 +462,7 @@ public:
             error = failure(L"TCP 수신 실패", code);
             return false;
         }
+        return true;
     }
 
 private:
@@ -453,7 +548,7 @@ public:
         // 상대 종단이 자기 수신 종단이면 송신 데이터그램이 장치 미경유로 즉시 반송
         if (remote_.sin_port == local.sin_port && isLocalAddress(remote_.sin_addr) &&
             (local.sin_addr.s_addr == htonl(INADDR_ANY) || local.sin_addr.s_addr == remote_.sin_addr.s_addr)) {
-            error = L"UDP 수신·상대 종단 동일. 자기 반송으로 인터페이스 장치 미경유.";
+            error = L"UDP 수신·상대 종단 동일. 자기 반송으로 인터페이스 장치 미경유. 수신 포트 또는 상대 주소·포트 변경 필요.";
             return false;
         }
         socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -462,12 +557,14 @@ public:
             error = failure(L"UDP 소켓 생성 실패", code);
             return false;
         }
+        enlargeReceiveBuffer(socket_);
         BOOL exclusive = TRUE;
         if (setsockopt(socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
                        sizeof(exclusive)) != 0 ||
             bind(socket_, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
             const long code = socketError();
-            error = failure(L"UDP 수신 포트 " + std::to_wstring(config_.localPort) + L" 점유 실패", code);
+            const wchar_t* hint = code == WSAEADDRINUSE || code == WSAEACCES ? L". 타 프로그램 점유" : L"";
+            error = failure(L"UDP 수신 포트 " + std::to_wstring(config_.localPort) + L" 열기 실패" + hint, code);
             close();
             return false;
         }
@@ -491,8 +588,6 @@ public:
         socket_ = INVALID_SOCKET;
     }
 
-    bool isOpen() const override { return socket_ != INVALID_SOCKET; }
-
     bool send(const Buffer& frame, std::wstring& error) override
     {
         const int sent = sendto(socket_, reinterpret_cast<const char*>(frame.data()), static_cast<int>(frame.size()), 0,
@@ -509,10 +604,11 @@ public:
         return true;
     }
 
-    bool receive(Buffer& inOut, std::wstring& error) override
+    bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
+        if (!awaitReadable(socket_, wait, L"UDP 수신 대기 실패", error)) return false;
         std::array<Byte, 2048> chunk{};
-        for (;;) {
+        for (std::size_t datagrams = 0; datagrams < kReceiveBurstDatagrams; ++datagrams) {
             sockaddr_in from{};
             int fromLength = sizeof(from);
             const int got = recvfrom(socket_, reinterpret_cast<char*>(chunk.data()), static_cast<int>(chunk.size()), 0,
@@ -540,6 +636,7 @@ public:
             error = failure(L"UDP 수신 실패", code);
             return false;
         }
+        return true;
     }
 
     LineFault takeFault() override
@@ -595,8 +692,8 @@ std::wstring describe(const TransportConfig& config)
     case TransportKind::Tcp:
         return L"TCP " + widen(config.tcp.host) + L":" + std::to_wstring(config.tcp.port);
     case TransportKind::Udp:
-        return L"UDP 수신 " + widen(config.udp.localHost) + L":" + std::to_wstring(config.udp.localPort) +
-               L" · 상대 " + widen(config.udp.remoteHost) + L":" + std::to_wstring(config.udp.remotePort);
+        return L"UDP 상대 " + widen(config.udp.remoteHost) + L":" + std::to_wstring(config.udp.remotePort) +
+               L" · 수신 " + widen(config.udp.localHost) + L":" + std::to_wstring(config.udp.localPort);
     }
     return {};
 }

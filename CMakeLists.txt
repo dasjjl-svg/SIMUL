@@ -22,6 +22,8 @@ add_executable(loopback_tester WIN32
     src/transport.h
     src/loopback_test.cpp
     src/loopback_test.h
+    src/scheduling.cpp
+    src/scheduling.h
     src/resource.h
     src/loopback_tester.rc
 )
@@ -38,6 +40,10 @@ if(MSVC)
     target_compile_options(loopback_tester PRIVATE /W4 /permissive- /utf-8)
     # 매니페스트는 리소스로 내장. 링커 자동 생성분과 중복 방지
     target_link_options(loopback_tester PRIVATE /MANIFEST:NO)
+elseif(MINGW)
+    target_compile_options(loopback_tester PRIVATE -Wall -Wextra)
+    # wWinMain 진입점 선택, 런타임 정적 링크로 MinGW DLL 배포 불요
+    target_link_options(loopback_tester PRIVATE -municode -static -static-libgcc -static-libstdc++)
 endif()
 
 target_link_libraries(loopback_tester PRIVATE

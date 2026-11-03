@@ -1,6 +1,7 @@
 #include "ui_draw.h"
 
 #include <algorithm>
+#include <cstddef>
 
 namespace loopback::ui {
 
@@ -165,7 +166,7 @@ void paintHeader(HDC target, const RECT& rc, FontCache& fonts, int base, const s
     RECT sub = area;
     sub.left += textWidth(dc, titleFont, title) + base * 3 / 4;
     label(dc, sub, subtitle, fonts.get(base), palette::TextFaint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    label(dc, area, note, fonts.get(base * 11 / 12), palette::TextMuted, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    label(dc, area, note, fonts.get(base * 11 / 12), palette::TextFaint, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
 
 void paintVerdict(HDC target, const RECT& rc, FontCache& fonts, int base, const VerdictView& view)
@@ -175,7 +176,7 @@ void paintVerdict(HDC target, const RECT& rc, FontCache& fonts, int base, const 
     fill(dc, rc, palette::Surface);
     rounded(dc, rc, base * 2 / 3, view.color, view.color);
 
-    const COLORREF soft = mix(view.color, palette::White, 0.72);
+    const COLORREF soft = palette::White;
     const COLORREF track = mix(view.color, palette::White, 0.30);
     const int pad = base + base / 3;
     const int captionH = base * 5 / 4;
@@ -213,27 +214,29 @@ void paintVerdict(HDC target, const RECT& rc, FontCache& fonts, int base, const 
     RECT detail{left, bar.bottom + detailGap, right, bar.bottom + detailGap + detailH};
     RECT text = detail;
     text.right -= textWidth(dc, strong, view.percent) + base;
-    label(dc, text, view.detail, body, mix(view.color, palette::White, 0.9),
+    label(dc, text, view.detail, body, palette::White,
           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     label(dc, detail, view.percent, strong, palette::White, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
 
-void paintSparkline(HDC dc, const RECT& cell, int base, const std::vector<bool>& outcomes)
+void paintTimeline(HDC dc, const RECT& cell, int base, const std::vector<std::uint8_t>& slots)
 {
-    if (outcomes.empty()) return;
-    const int bar = (std::max)(2, base / 5);
+    if (slots.empty()) return;
+    const int bar = (std::max)(2, base / 6);
     const int gap = 1;
     const int padX = base / 3;
-    const int height = (std::max)(4, static_cast<int>(cell.bottom - cell.top) * 5 / 9);
-    const LONG top = cell.top + (cell.bottom - cell.top - height) / 2;
+    const int height = (std::max)(6, static_cast<int>(cell.bottom - cell.top) * 3 / 5);
+    const LONG bottom = cell.bottom - (cell.bottom - cell.top - height) / 2;
     const int width = static_cast<int>(cell.right - cell.left) - padX * 2;
-    const auto slots = static_cast<std::size_t>((std::max)(0, (width + gap) / (bar + gap)));
-    const std::size_t shown = (std::min)(slots, outcomes.size());
-    LONG right = cell.right - padX;
-    for (std::size_t i = 0; i < shown; ++i) {
-        const bool ok = outcomes[outcomes.size() - 1 - i];
-        fill(dc, RECT{right - bar, top, right, top + height}, ok ? palette::CellPass : palette::CellFault);
-        right -= bar + gap;
+    const std::size_t count = (std::min)(slots.size(), static_cast<std::size_t>((std::max)(1, (width + gap) / (bar + gap))));
+    LONG left = cell.left + padX;
+    for (std::size_t k = 0; k < count; ++k) {
+        std::uint8_t mark = 0;
+        for (std::size_t i = k * slots.size() / count; i < (k + 1) * slots.size() / count; ++i) mark = (std::max)(mark, slots[i]);
+        const int barHeight = mark == 2 ? height : mark == 1 ? height / 2 : (std::max)(1, base / 12);
+        const COLORREF color = mark == 2 ? palette::CellFault : mark == 1 ? palette::CellPass : palette::CellEmpty;
+        fill(dc, RECT{left, bottom - barHeight, left + bar, bottom}, color);
+        left += bar + gap;
     }
 }
 
@@ -265,8 +268,9 @@ void paintButton(const DRAWITEMSTRUCT& item, FontCache& fonts, int base, bool pr
     COLORREF face;
     COLORREF edge;
     COLORREF ink;
-    if (primary) {
-        face = disabled ? palette::BorderStrong : pressed ? palette::AccentDark : palette::Accent;
+    // 비활성 주 단추는 보조 단추 비활성 표시와 동일. 시험 중 활성 단추(중지) 우선 강조
+    if (primary && !disabled) {
+        face = pressed ? palette::AccentDark : palette::Accent;
         edge = face;
         ink = palette::White;
     } else {

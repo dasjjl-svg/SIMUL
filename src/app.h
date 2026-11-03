@@ -58,7 +58,6 @@ private:
         std::size_t passed = 0;
         std::size_t failedChannels = 0;
         std::size_t stopped = 0;
-        bool running = false;
         std::uint64_t matched = 0;
         std::chrono::milliseconds elapsed{0};
         std::wstring failedList;
@@ -117,9 +116,11 @@ private:
     void setInputsEnabled(bool enabled);
     void appendLog(const std::wstring& line,
                    std::chrono::system_clock::time_point when = std::chrono::system_clock::now());
-    void appendChannelEvents(std::size_t channel, const std::vector<TestEvent>& events);
+    void appendEvents();
+    void updateTitle();
     void refreshFonts();
-    void invalidatePanels();
+    void invalidateVerdict();
+    void holdProcessResources();
     void releaseSystemHolds();
 
     Overall overall() const;
@@ -132,7 +133,6 @@ private:
     HWND dialog_ = nullptr;
     HWND list_ = nullptr;
     ui::FontCache fonts_;
-    HFONT sectionFont_ = nullptr;
     HBRUSH surfaceBrush_ = nullptr;
     HBRUSH disabledBrush_ = nullptr;
 
@@ -143,6 +143,8 @@ private:
     std::array<std::array<std::wstring, 9>, kMaxChannels> cells_{};
     std::set<std::wstring> realcomPorts_;
     std::wstring detailText_;
+    std::wstring summaryText_;
+    std::wstring titleText_;
     std::size_t channelCount_ = 1;
     std::size_t selected_ = 0;
     bool loading_ = false;
@@ -152,6 +154,16 @@ private:
     bool hasResult_ = false;
     bool timerRaised_ = false;
     bool sleepBlocked_ = false;
+
+    struct WorkingSet {
+        SIZE_T minimum = 0;
+        SIZE_T maximum = 0;
+        DWORD flags = 0;
+    };
+    bool priorityRaised_ = false;
+    DWORD savedPriority_ = NORMAL_PRIORITY_CLASS;
+    bool workingSetHeld_ = false;
+    WorkingSet savedWorkingSet_{};
 };
 
 }  // namespace loopback

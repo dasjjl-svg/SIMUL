@@ -1,10 +1,10 @@
 #include "loopback_test.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <iterator>
 
 #include "format.h"
+#include "scheduling.h"
 
 namespace loopback {
 
@@ -35,15 +35,6 @@ std::uint64_t millisecondsOf(std::chrono::steady_clock::duration value)
     return ms > 0 ? static_cast<std::uint64_t>(ms) : 0;
 }
 
-// 소수점 1자리 ms 표기
-std::wstring preciseMs(std::chrono::steady_clock::duration value)
-{
-    wchar_t buffer[32]{};
-    std::swprintf(buffer, std::size(buffer), L"%.1f ms",
-                  static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(value).count()) / 1000.0);
-    return buffer;
-}
-
 }  // namespace
 
 LoopbackTest::LoopbackTest() = default;
@@ -66,14 +57,7 @@ bool LoopbackTest::open(const TestSettings& settings, std::wstring& error)
     return true;
 }
 
-bool LoopbackTest::start(const TestSettings& settings, std::wstring& error)
-{
-    if (!open(settings, error)) return false;
-    begin();
-    return true;
-}
-
-void LoopbackTest::begin()
+void LoopbackTest::begin(std::size_t lane)
 {
     if (!transport_ || worker_.joinable()) return;
     {
@@ -81,13 +65,13 @@ void LoopbackTest::begin()
         state_ = {};
         state_.running = true;
         state_.duration = settings_.duration;
-        state_.echoTimeout = settings_.echoTimeout;
+        // 시험 중 힙 할당 배제용 용량 선확보: 미회신 대기열은 회신 제한 구간 송신분 + 여유
         pending_.clear();
-        expired_.clear();
-        answered_.clear();
+        pending_.reserve(static_cast<std::size_t>(settings_.echoTimeout / settings_.interval) + 64);
+        expired_.reset(expiredCapacity);
+        answered_.reset(answeredCapacity);
         events_.clear();
-        recentCount_ = 0;
-        recentNext_ = 0;
+        timeline_.fill(0);
         latencySumUs_ = 0;
         loggedFailures_ = 0;
         summarizedFailures_ = 0;
@@ -99,6 +83,9 @@ void LoopbackTest::begin()
         if (!notice.empty()) note(notice);
     }
     rxBuffer_.clear();
+    rxBuffer_.reserve(65536);
+    txFrame_.reserve(MAX_FRAME_SIZE);
+    lane_ = lane;
     startedAt_ = Clock::now();
     cancel_.store(false);
     worker_ = std::thread([this] { run(); });
@@ -134,10 +121,7 @@ TestSnapshot LoopbackTest::snapshot() const
     if (copy.elapsed > copy.duration) copy.elapsed = copy.duration;
     if (copy.matched) copy.meanLatency = std::chrono::microseconds(
         static_cast<std::chrono::microseconds::rep>(latencySumUs_ / copy.matched));
-    copy.recent.reserve(recentCount_);
-    const std::size_t first = (recentNext_ + recentCapacity - recentCount_) % recentCapacity;
-    for (std::size_t i = 0; i < recentCount_; ++i)
-        copy.recent.push_back(recent_[(first + i) % recentCapacity]);
+    copy.timeline.assign(timeline_.begin(), timeline_.end());
     return copy;
 }
 
@@ -152,6 +136,7 @@ std::vector<TestEvent> LoopbackTest::takeEvents()
 
 void LoopbackTest::run()
 {
+    prepareWorkerThread(lane_);
     const auto deadline = startedAt_ + settings_.duration;
     auto nextTx = startedAt_;
     bool draining = false;
@@ -181,16 +166,25 @@ void LoopbackTest::run()
             item.seq = ++seq;
             item.sentAt = now;
             randomData(item.data);
-            const Buffer frame = buildFrame(item.data);
-            item.wireBytes = frame.size();
+            buildFrame(item.data, txFrame_);
+            item.wireBytes = txFrame_.size();
             std::wstring error;
-            if (!transport_->send(frame, error)) {
+            if (!transport_->send(txFrame_, error)) {
                 abortReason = L"송신 오류: " + error;
                 break;
             }
+            const bool sendEcho = transport_->takeSendEcho();
             std::lock_guard<std::mutex> lock(mutex_);
             ++state_.sent;
             pending_.push_back(item);
+            // 반향 미발생 설정 중 송신 진행 구간 수신: 자기 송신 반향 확정. 송신 전문 사본부터 반향 제거 적용
+            if (sendEcho && halfDuplex_ && !dropLocalEcho_) {
+                dropLocalEcho_ = true;
+                echoDetected_ = true;
+                const std::wstring text = L"송신 중 수신 검출 (반이중 선로 송신 반향). 송신 반향 설정 '발생' 필요 (이후 반향 제거 적용)";
+                fail(item.seq, text, now, false);
+                note(L"#" + std::to_wstring(item.seq) + L" " + text);
+            }
             // 1주기 이상 지연 송신은 누락 주기 실패 계수 (절전·스케줄링 정지·회선 정체)
             // 누락 주기는 시험 시간 내 예정분만 계수, 최소 1주기
             const auto slot = nextTx;
@@ -209,8 +203,19 @@ void LoopbackTest::run()
             }
         }
 
+        // 다음 처리 시각(송신 주기·회신 제한 만료·잔여 회신 대기 종료)까지 수신 대기. 주기 폴링 배제
+        auto wake = Clock::now() + idleWait;
+        if (!draining) wake = (std::min)(wake, nextTx);
+        else wake = (std::min)(wake, drainUntil);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!pending_.empty())
+                wake = (std::min)(wake, pending_.front().sentAt + settings_.echoTimeout + std::chrono::milliseconds(1));
+        }
+        const auto wait = (std::max)(std::chrono::milliseconds(0),
+                                     std::chrono::ceil<std::chrono::milliseconds>(wake - Clock::now()));
         std::wstring error;
-        const bool received = transport_->receive(rxBuffer_, error);
+        const bool received = transport_->receive(rxBuffer_, wait, error);
         const LineFault fault = transport_->takeFault();
         const auto at = Clock::now();
         {
@@ -233,8 +238,6 @@ void LoopbackTest::run()
             abortReason = L"수신 오류: " + error;
             break;
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     finish(abortReason);
@@ -267,13 +270,13 @@ void LoopbackTest::finish(const std::wstring& abortReason)
 
     if (state_.failed) {
         state_.verdict = Verdict::Fail;
-        note(L"시험 실패. 실패 " + grouped(state_.failed) + L"건, 정상 회신 " + grouped(state_.matched) + L"건.");
+        note(L"판정 FAIL. 이상 " + grouped(state_.failed) + L"건, 정상 회신 " + grouped(state_.matched) + L"건.");
     } else if (cancelled) {
         state_.verdict = Verdict::Stopped;
-        note(L"사용자 중지. 시험 시간 미완료로 판정 보류.");
+        note(L"판정 보류. 사용자 중지로 시험 시간 미완료.");
     } else {
         state_.verdict = Verdict::Ok;
-        note(L"시험 성공. 전 전문 정상 회신 " + grouped(state_.matched) + L"건." +
+        note(L"판정 OK. 전 전문 정상 회신 " + grouped(state_.matched) + L"건." +
              (halfDuplex_ && !dropLocalEcho_ ? L" 송신 반향 미발생 설정 기준." : L""));
     }
     state_.elapsed = sinceStart(end);
@@ -305,9 +308,9 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Data& got, Clock
             dropLocalEcho_ = true;
             echoDetected_ = true;
             match->localEchoSeen = true;
-            const std::wstring text = L"송신 반향 검출 (" + preciseMs(latency) + L" 회신, 장치 회신 하한 " +
-                                      preciseMs(replyFloor(match->wireBytes)) +
-                                      L"). 이후 반향 제거 적용, 송신 반향 설정 '발생' 필요";
+            const std::wstring text = L"송신 반향 검출 (" + msText(latency) + L" 회신, 장치 회신 하한 " +
+                                      msText(replyFloor(match->wireBytes)) +
+                                      L"). 송신 반향 설정 '발생' 필요 (이후 반향 제거 적용)";
             // 상세 기록 상한과 무관하게 항상 기록
             fail(match->seq, text, at, false);
             note(L"#" + std::to_wstring(match->seq) + L" " + text);
@@ -317,15 +320,13 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Data& got, Clock
         if (latency > settings_.echoTimeout)
             fail(match->seq, L"회신 시간 초과 (" + grouped(millisecondsOf(latency)) + L" ms 회신)", at);
         else
-            pass(latency);
-        answered_.push_back(*match);
-        if (answered_.size() > answeredCapacity) answered_.pop_front();
+            pass(latency, at);
+        answered_.push(*match);
         pending_.erase(match);
         return;
     }
 
-    const auto late = std::find_if(expired_.begin(), expired_.end(), sameData);
-    if (late != expired_.end()) {
+    if (Outstanding* late = expired_.find(got)) {
         // 시간 초과 판정 전문의 자기 송신 반향 사본은 판정 제외
         if (dropLocalEcho_ && !late->localEchoSeen) {
             late->localEchoSeen = true;
@@ -334,16 +335,14 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Data& got, Clock
         ++state_.received;
         detail(L"#" + std::to_wstring(late->seq) + L" 지연 회신 (" + grouped(millisecondsOf(at - late->sentAt)) +
                    L" ms, 시간 초과 판정 완료분)", at);
-        answered_.push_back(*late);
-        if (answered_.size() > answeredCapacity) answered_.pop_front();
-        expired_.erase(late);
+        answered_.push(*late);
+        late->seq = 0;
         return;
     }
 
     ++state_.received;
-    const auto again = std::find_if(answered_.rbegin(), answered_.rend(), sameData);
-    if (again != answered_.rend()) {
-        fail(again->seq, halfDuplex_ && !dropLocalEcho_ ? L"중복 회신 (자기 송신 반향 시 송신 반향 설정 '발생' 필요)"
+    if (const Outstanding* again = answered_.find(got)) {
+        fail(again->seq, halfDuplex_ && !dropLocalEcho_ ? L"중복 회신 (송신 반향이면 송신 반향 설정 '발생' 필요)"
                                                        : L"중복 회신", at);
         return;
     }
@@ -362,18 +361,17 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Data& got, Clock
 
 void LoopbackTest::expire(Clock::time_point now)
 {
-    while (!pending_.empty() && now - pending_.front().sentAt > settings_.echoTimeout) {
-        const Outstanding& item = pending_.front();
+    auto item = pending_.begin();
+    for (; item != pending_.end() && now - item->sentAt > settings_.echoTimeout; ++item) {
         std::wstring text = L"회신 시간 초과 (" + grouped(static_cast<std::uint64_t>(settings_.echoTimeout.count())) +
                             L" ms)";
-        if (item.localEchoSeen)
+        if (item->localEchoSeen)
             text += echoDetected_ ? L". 송신 반향만 수신, 장치 무회신"
-                                  : L". 사본 1건만 수신: 장치 무회신 또는 반향 미발생 어댑터 (송신 반향 설정 확인)";
-        fail(item.seq, text, now);
-        expired_.push_back(pending_.front());
-        if (expired_.size() > expiredCapacity) expired_.pop_front();
-        pending_.pop_front();
+                                  : L". 사본 1건만 수신: 장치 무회신 또는 송신 반향 미발생 어댑터 (송신 반향 설정 확인)";
+        fail(item->seq, text, now);
+        expired_.push(*item);
     }
+    pending_.erase(pending_.begin(), item);
 }
 
 void LoopbackTest::fail(std::uint64_t seq, const std::wstring& text, Clock::time_point at, bool log,
@@ -381,7 +379,7 @@ void LoopbackTest::fail(std::uint64_t seq, const std::wstring& text, Clock::time
 {
     state_.failed += count;
     state_.verdict = Verdict::Fail;
-    remember(false);
+    remember(false, at);
 
     const std::wstring tagged = (seq ? L"#" + std::to_wstring(seq) + L" " : std::wstring()) + text;
     if (!state_.hasFailure) {
@@ -392,10 +390,10 @@ void LoopbackTest::fail(std::uint64_t seq, const std::wstring& text, Clock::time
     if (log) detail(tagged, at);
 }
 
-void LoopbackTest::pass(Clock::duration latency)
+void LoopbackTest::pass(Clock::duration latency, Clock::time_point at)
 {
     ++state_.matched;
-    remember(true);
+    remember(true, at);
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(latency);
     if (us.count() > 0) latencySumUs_ += static_cast<std::uint64_t>(us.count());
     if (us > state_.maxLatency) state_.maxLatency = us;
@@ -417,7 +415,7 @@ void LoopbackTest::summarize(Clock::time_point now)
 {
     if (loggedFailures_ < failureLogLimit || now - summarizedAt_ < summaryInterval) return;
     if (state_.failed > summarizedFailures_) {
-        note(L"최근 " + std::to_wstring(summaryInterval.count()) + L"분 실패 " +
+        note(L"최근 " + std::to_wstring(summaryInterval.count()) + L"분 이상 " +
              grouped(state_.failed - summarizedFailures_) + L"건 (누적 " + grouped(state_.failed) + L"건)");
     }
     summarizedFailures_ = state_.failed;
@@ -430,16 +428,43 @@ void LoopbackTest::note(std::wstring text)
     if (events_.size() > eventQueueLimit) events_.pop_front();
 }
 
-void LoopbackTest::remember(bool ok)
+// 발생 시각 기준 구간에 판정 누적. 구간 내 이상 1건이면 해당 구간 이상
+void LoopbackTest::remember(bool ok, Clock::time_point at)
 {
-    recent_[recentNext_] = ok;
-    recentNext_ = (recentNext_ + 1) % recentCapacity;
-    if (recentCount_ < recentCapacity) ++recentCount_;
+    const double fraction = std::chrono::duration<double>(at - startedAt_) / std::chrono::duration<double>(settings_.duration);
+    const auto slot = (std::min)(timelineSlots - 1, static_cast<std::size_t>(std::clamp(fraction, 0.0, 1.0) * timelineSlots));
+    const std::uint8_t mark = ok ? 1 : 2;
+    if (timeline_[slot] < mark) timeline_[slot] = mark;
 }
 
 std::chrono::milliseconds LoopbackTest::sinceStart(Clock::time_point at) const
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(at - startedAt_);
+}
+
+void LoopbackTest::History::reset(std::size_t capacity)
+{
+    items_.assign(capacity, Outstanding{});
+    next_ = 0;
+    size_ = 0;
+}
+
+void LoopbackTest::History::push(const Outstanding& item)
+{
+    if (items_.empty()) return;
+    items_[next_] = item;
+    next_ = (next_ + 1) % items_.size();
+    size_ = (std::min)(size_ + 1, items_.size());
+}
+
+LoopbackTest::Outstanding* LoopbackTest::History::find(const Data& data)
+{
+    const std::size_t capacity = items_.size();
+    for (std::size_t i = 0; i < size_; ++i) {
+        Outstanding& item = items_[(next_ + capacity - 1 - i) % capacity];
+        if (item.seq && item.data == data) return &item;
+    }
+    return nullptr;
 }
 
 LoopbackTest::Clock::duration LoopbackTest::replyFloor(std::size_t wireBytes) const

@@ -6,8 +6,8 @@
 #include <ws2tcpip.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <ctime>
+#include <cwchar>
 #include <cwctype>
 #include <iterator>
 #include <thread>
@@ -27,6 +27,7 @@ constexpr UINT kCountDelayMs = 400;  // 채널 수 입력 확정 대기. 중간 
 constexpr UINT kRefreshFontsMessage = WM_APP + 1;
 constexpr UINT kComboSyncMessage = WM_APP + 2;
 constexpr int kLogLimit = 2000000;
+constexpr SIZE_T kResidentBytes = 64 * 1024 * 1024;  // 시험 중 작업 집합 상주 하한
 
 constexpr const wchar_t* kAppTitle = L"Loopback Tester";
 constexpr const wchar_t* kRegistryKey = L"Software\\LoopbackTester";
@@ -46,7 +47,7 @@ enum TransportIndex { kSerial = 0, kTcp = 1, kUdp = 2 };
 enum StandardIndex { kRs232 = 0, kRs422 = 1, kRs485TwoWire = 2, kRs485FourWire = 3 };
 enum EchoIndex { kEchoUnset = 0, kEchoPresent = 1, kEchoAbsent = 2 };
 enum Column {
-    kColChannel, kColKind, kColTarget, kColVerdict, kColSent, kColMatched, kColFailed, kColLatency, kColRecent,
+    kColChannel, kColKind, kColTarget, kColVerdict, kColSent, kColMatched, kColFailed, kColLatency, kColTrend,
     kColumnCount
 };
 
@@ -58,9 +59,9 @@ struct ColumnSpec {
 
 // 열 폭 단위: 대화상자 단위(DLU). 합계 384, 목록 폭 400에서 테두리·세로 스크롤 막대 여유 제외
 constexpr ColumnSpec kColumns[kColumnCount] = {
-    {L"CH", 20, LVCFMT_LEFT},     {L"접속", 42, LVCFMT_LEFT},      {L"대상", 106, LVCFMT_LEFT},
-    {L"판정", 40, LVCFMT_CENTER}, {L"송신", 38, LVCFMT_RIGHT},     {L"정상 회신", 40, LVCFMT_RIGHT},
-    {L"실패", 30, LVCFMT_RIGHT},  {L"최대 지연", 36, LVCFMT_RIGHT}, {L"최근", 32, LVCFMT_LEFT},
+    {L"CH", 18, LVCFMT_LEFT},     {L"접속", 42, LVCFMT_LEFT},      {L"대상", 100, LVCFMT_LEFT},
+    {L"판정", 36, LVCFMT_CENTER}, {L"송신", 38, LVCFMT_RIGHT},     {L"정상 회신", 40, LVCFMT_RIGHT},
+    {L"이상", 40, LVCFMT_RIGHT},  {L"최대 지연", 36, LVCFMT_RIGHT}, {L"추이", 34, LVCFMT_LEFT},
 };
 
 constexpr const wchar_t* kKindNames[] = {L"직렬 (RS-232·422·485)", L"TCP 클라이언트", L"UDP"};
@@ -71,7 +72,7 @@ constexpr const wchar_t* kDataBits[] = {L"5", L"6", L"7", L"8"};
 constexpr const wchar_t* kParityNames[] = {L"없음 (N)", L"홀수 (O)", L"짝수 (E)", L"마크 (M)", L"스페이스 (S)"};
 constexpr const wchar_t* kStopNames[] = {L"1", L"1.5", L"2"};
 constexpr const wchar_t* kFlowNames[] = {L"없음", L"RTS/CTS", L"DTR/DSR"};
-constexpr const wchar_t* kEchoNames[] = {L"선택 필요", L"발생 (자기 송신분 제거)", L"미발생"};
+constexpr const wchar_t* kEchoNames[] = {L"선택 필요", L"발생 (반향 제거)", L"미발생"};
 
 constexpr int kSerialControls[] = {IDC_SERIAL_STANDARD_LABEL, IDC_SERIAL_STANDARD, IDC_SERIAL_PORT_LABEL,
                                    IDC_SERIAL_PORT, IDC_SERIAL_REFRESH, IDC_SERIAL_BAUD_LABEL, IDC_SERIAL_BAUD,
@@ -89,7 +90,7 @@ constexpr int kInputControls[] = {IDC_CHANNEL_COUNT, IDC_CHANNEL_COUNT_SPIN, IDC
                                   IDC_SERIAL_BAUD, IDC_SERIAL_DATA, IDC_SERIAL_PARITY, IDC_SERIAL_STOP,
                                   IDC_SERIAL_FLOW, IDC_SERIAL_ECHO, IDC_TCP_HOST, IDC_TCP_PORT, IDC_UDP_LOCAL_HOST,
                                   IDC_UDP_LOCAL_PORT, IDC_UDP_REMOTE_HOST, IDC_UDP_REMOTE_PORT};
-constexpr int kMutedLabels[] = {IDC_CHANNEL_SUMMARY, IDC_CHANNEL_DETAIL, IDC_SERIAL_BAUD_UNIT, IDC_SERIAL_ECHO_HINT,
+constexpr int kMutedLabels[] = {IDC_CHANNEL_SUMMARY, IDC_SERIAL_BAUD_UNIT, IDC_SERIAL_ECHO_HINT,
                                 IDC_DURATION_HOURS_UNIT, IDC_DURATION_MINUTES_UNIT, IDC_ECHO_UNIT};
 constexpr int kSections[] = {IDC_SECTION_TEST, IDC_SECTION_CHANNELS, IDC_SECTION_EDITOR, IDC_SECTION_LOG};
 
@@ -166,13 +167,6 @@ bool parseIpv4(const std::wstring& value, bool allowAny, std::string& out)
     return true;
 }
 
-std::wstring milliseconds(std::chrono::microseconds value)
-{
-    wchar_t buffer[32]{};
-    std::swprintf(buffer, std::size(buffer), L"%.1f ms", static_cast<double>(value.count()) / 1000.0);
-    return buffer;
-}
-
 std::wstring channelName(std::size_t index)
 {
     return L"CH" + std::to_wstring(index + 1);
@@ -200,17 +194,15 @@ std::wstring channelRanges(const std::vector<std::size_t>& channels)
 std::wstring targetText(const ChannelForm& form)
 {
     static const wchar_t parities[] = {L'N', L'O', L'E', L'M', L'S'};
-    static const wchar_t* const stops[] = {L"1", L"1.5", L"2"};
-    static const wchar_t* const standards[] = {L"", L" · 422", L" · 485-2W", L" · 485-4W"};
+    static const wchar_t* const standards[] = {L"", L" · 422", L" · 485 2선", L" · 485 4선"};
     switch (form.kind) {
     case kTcp:
         return trimmed(form.tcpHost) + L":" + trimmed(form.tcpPort);
     case kUdp:
-        return trimmed(form.udpRemoteHost) + L":" + trimmed(form.udpRemotePort) + L" (수신 " +
-               trimmed(form.udpLocalPort) + L")";
+        return trimmed(form.udpRemoteHost) + L":" + trimmed(form.udpRemotePort);
     default:
         return portToken(form.serialPort) + L" · " + trimmed(form.baud) + L" " + std::to_wstring(form.dataBits) +
-               parities[std::clamp(form.parity, 0, 4)] + stops[std::clamp(form.stopBits, 0, 2)] +
+               parities[std::clamp(form.parity, 0, 4)] + kStopNames[std::clamp(form.stopBits, 0, 2)] +
                standards[std::clamp(form.standard, 0, 3)];
     }
 }
@@ -375,7 +367,6 @@ App::~App()
     for (auto& test : tests_)
         if (test) test->stop();
     releaseSystemHolds();
-    if (sectionFont_) DeleteObject(sectionFont_);
     if (surfaceBrush_) DeleteObject(surfaceBrush_);
     if (disabledBrush_) DeleteObject(disabledBrush_);
 }
@@ -617,6 +608,12 @@ void App::onCommand(int id, int code)
     case IDC_STOP_BUTTON:
         if (code == BN_CLICKED) stopTest();
         break;
+    case IDOK:
+        // 소유자 그리기 단추는 기본 단추 지정 불가. 초점 단추의 Enter 입력을 해당 동작으로 연결
+        if (GetFocus() == item(IDC_START_BUTTON)) startTest();
+        else if (GetFocus() == item(IDC_STOP_BUTTON)) stopTest();
+        else if (GetFocus() == item(IDC_SERIAL_REFRESH)) refreshPorts();
+        break;
     default:
         // IDCANCEL(Esc 키) 무시. 결과 표시 중 의도치 않은 종료 방지, 종료는 WM_CLOSE 경유
         break;
@@ -655,12 +652,17 @@ void App::onTimer()
     for (std::size_t i = 0; i < kMaxChannels; ++i) {
         if (!tests_[i]) continue;
         views_[i] = tests_[i]->snapshot();
-        appendChannelEvents(i, tests_[i]->takeEvents());
         anyRunning = anyRunning || views_[i].running;
     }
-    refreshRows();
-    refreshDetail();
-    invalidatePanels();
+    appendEvents();
+    // 최소화 중 화면 갱신 생략. 시험 기록·판정 수집과 제목 표시줄 상태는 계속
+    updateTitle();
+    if (!IsIconic(dialog_)) {
+        refreshRows();
+        refreshDetail();
+        refreshSummary();
+        invalidateVerdict();
+    }
     if (!anyRunning) finishTest();
 }
 
@@ -669,8 +671,7 @@ void App::onDrawItem(const DRAWITEMSTRUCT& draw)
     const int base = ui::basePixels(dialog_);
     switch (draw.CtlID) {
     case IDC_HEADER:
-        ui::paintHeader(draw.hDC, draw.rcItem, fonts_, base, kAppTitle, L"인터페이스 장치 반송 시험",
-                        L"최대 " + std::to_wstring(kMaxChannels) + L"채널 · v1.0");
+        ui::paintHeader(draw.hDC, draw.rcItem, fonts_, base, kAppTitle, L"인터페이스 장치 반송 시험", L"v1.0");
         break;
     case IDC_VERDICT:
         ui::paintVerdict(draw.hDC, draw.rcItem, fonts_, base, verdictView());
@@ -737,7 +738,7 @@ void App::startTest()
     }
     const std::wstring warnings = planWarnings(plan);
     if (!warnings.empty() &&
-        MessageBoxW(dialog_, (L"판정 FAIL 예상 조건 포함.\n\n" + warnings + L"\n시험 시작?").c_str(), kAppTitle,
+        MessageBoxW(dialog_, (L"시험 조건 확인 필요.\n\n" + warnings + L"\n시험 시작?").c_str(), kAppTitle,
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
     saveSettings();
@@ -746,7 +747,7 @@ void App::startTest()
     timerRaised_ = timeBeginPeriod(1) == TIMERR_NOERROR;
     const HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
 
-    // 채널별 전송로 병렬 개방. TCP 접속 대기 상한 3s가 채널 수만큼 누적되지 않도록 동시 수행
+    // 채널별 전송로 병렬 개방. TCP 접속 대기 상한 3s의 채널 수 누적 방지
     std::array<std::unique_ptr<LoopbackTest>, kMaxChannels> prepared{};
     std::array<std::wstring, kMaxChannels> errors{};
     std::array<bool, kMaxChannels> opened{};
@@ -769,13 +770,17 @@ void App::startTest()
     for (const Plan& entry : plan) {
         if (opened[entry.channel]) continue;
         failures += channelName(entry.channel) + L": " + errors[entry.channel] + L"\n";
-        appendLog(channelName(entry.channel) + L" · 접속 실패: " + errors[entry.channel]);
+        appendLog(channelName(entry.channel) + L" · " + errors[entry.channel]);
     }
     if (!failures.empty()) {
         for (auto& test : prepared)
             if (test) test->stop();
         releaseSystemHolds();
-        MessageBoxW(dialog_, (L"접속 실패로 시험 미시작.\n\n" + failures).c_str(), kAppTitle, MB_ICONERROR | MB_OK);
+        appendLog(L"접속 실패로 시험 미시작.");
+        MessageBoxW(dialog_,
+                    (L"접속 실패로 시험 미시작.\n\n" + failures +
+                     L"\n포트·주소 설정, 장치 전원·결선, 타 프로그램 점유 여부 확인 후 재시작.").c_str(),
+                    kAppTitle, MB_ICONERROR | MB_OK);
         return;
     }
 
@@ -784,15 +789,14 @@ void App::startTest()
         active_[entry.channel] = true;
         tests_[entry.channel] = std::move(prepared[entry.channel]);
         views_[entry.channel].running = true;
-        views_[entry.channel].duration = entry.settings.duration;
     }
-    for (const Plan& entry : plan) tests_[entry.channel]->begin();
 
     duration_ = plan.front().settings.duration;
     running_ = true;
     // 장시간 무인 시험 중 시스템 절전 진입 방지, 시스템 종료 시 차단 사유 표시
     sleepBlocked_ = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) != 0;
-    ShutdownBlockReasonCreate(dialog_, L"반송 시험 진행 중. 종료 시 시험 중단.");
+    holdProcessResources();
+    ShutdownBlockReasonCreate(dialog_, L"반송 시험 진행 중. 종료 시 시험 중지.");
     setInputsEnabled(false);
 
     appendLog(L"시험 시작. 사용 " + std::to_wstring(plan.size()) + L"채널 · 시험 시간 " +
@@ -802,10 +806,12 @@ void App::startTest()
         const TransportConfig& transport = entry.settings.transport;
         const bool realcom = transport.kind == TransportKind::Serial && realcomPorts_.count(transport.serial.port);
         appendLog(channelName(entry.channel) + L" · " + describe(transport) +
-                  (realcom ? L" · Real COM (인터페이스 방식은 NPort 장치 설정 적용)" : L""));
+                  (realcom ? L" · Real COM (통신 규격은 NPort 장치 설정 적용)" : L""));
     }
+    // 작업 스레드 기동은 시작 기록 이후. 채널별 기록의 시각 순서 유지
+    for (const Plan& entry : plan) tests_[entry.channel]->begin(entry.channel);
     onTimer();
-    // 시작 후 중지 단추 초점 배제. 키 입력 1회에 의한 장시간 시험 중지 방지
+    // 비활성화된 시작 단추의 초점을 채널 목록으로 이동. 중지 단추는 초점 대상 제외
     SetFocus(list_);
 }
 
@@ -831,9 +837,9 @@ void App::finishTest()
         if (!tests_[i]) continue;
         tests_[i]->stop();
         views_[i] = tests_[i]->snapshot();
-        appendChannelEvents(i, tests_[i]->takeEvents());
-        tests_[i].reset();
     }
+    appendEvents();
+    for (auto& test : tests_) test.reset();
     running_ = false;
     hasResult_ = true;
     releaseSystemHolds();
@@ -850,8 +856,10 @@ void App::finishTest()
     }
     refreshRows();
     refreshDetail();
-    invalidatePanels();
-    // 판정·최근 열 최종 상태 재도장
+    refreshSummary();
+    updateTitle();
+    invalidateVerdict();
+    // 판정·추이 열 최종 상태 반영용 목록 무효화
     InvalidateRect(list_, nullptr, FALSE);
     SetFocus(item(IDC_START_BUTTON));
 }
@@ -942,18 +950,18 @@ bool App::readChannel(std::size_t index, TransportConfig& config, std::wstring& 
         }
         // Windows 직렬 규칙: 정지 비트 1.5는 데이터 비트 5 전용, 데이터 비트 5는 정지 비트 2 불가
         if (form.stopBits == ONE5STOPBITS && form.dataBits != 5) {
-            error = L"정지 비트 1.5는 데이터 비트 5 전용.";
+            error = L"정지 비트 1.5는 데이터 비트 5 전용. 정지 비트 1 또는 2 지정.";
             field = IDC_SERIAL_STOP;
             return false;
         }
         if (form.stopBits == TWOSTOPBITS && form.dataBits == 5) {
-            error = L"데이터 비트 5와 정지 비트 2 조합 불가.";
+            error = L"데이터 비트 5와 정지 비트 2 조합 불가. 정지 비트 1 또는 1.5 지정.";
             field = IDC_SERIAL_STOP;
             return false;
         }
         // 반향 여부 미지정 상태의 자기 송신 반향은 장치 무회신에도 정상 판정 유발. 시작 전 명시 선택 강제
         if (form.standard == kRs485TwoWire && form.echo == kEchoUnset) {
-            error = L"RS-485 2선식 송신 반향 선택 필요. 어댑터가 자기 송신 데이터를 수신하면 '발생', 아니면 '미발생'.";
+            error = L"RS-485 2선식 송신 반향 선택 필요. 어댑터가 자기 송신 전문을 수신하면 '발생', 아니면 '미발생' 선택.";
             field = IDC_SERIAL_ECHO;
             return false;
         }
@@ -984,17 +992,6 @@ bool App::readChannel(std::size_t index, TransportConfig& config, std::wstring& 
         return true;
     case kUdp:
         config.kind = TransportKind::Udp;
-        if (!parseIpv4(trimmed(form.udpLocalHost), true, config.udp.localHost)) {
-            error = L"UDP 수신 주소 형식 오류. IPv4 주소 또는 0.0.0.0 지정.";
-            field = IDC_UDP_LOCAL_HOST;
-            return false;
-        }
-        if (!parseNumber(trimmed(form.udpLocalPort), 65535, number) || !number) {
-            error = L"UDP 수신 포트 범위 오류. 1~65535 지정.";
-            field = IDC_UDP_LOCAL_PORT;
-            return false;
-        }
-        config.udp.localPort = static_cast<unsigned short>(number);
         if (!parseIpv4(trimmed(form.udpRemoteHost), false, config.udp.remoteHost)) {
             error = L"UDP 상대 주소 형식 오류. IPv4 주소 지정 (예: 192.168.0.10).";
             field = IDC_UDP_REMOTE_HOST;
@@ -1006,6 +1003,17 @@ bool App::readChannel(std::size_t index, TransportConfig& config, std::wstring& 
             return false;
         }
         config.udp.remotePort = static_cast<unsigned short>(number);
+        if (!parseIpv4(trimmed(form.udpLocalHost), true, config.udp.localHost)) {
+            error = L"UDP 수신 주소 형식 오류. IPv4 주소 또는 0.0.0.0 지정.";
+            field = IDC_UDP_LOCAL_HOST;
+            return false;
+        }
+        if (!parseNumber(trimmed(form.udpLocalPort), 65535, number) || !number) {
+            error = L"UDP 수신 포트 범위 오류. 1~65535 지정.";
+            field = IDC_UDP_LOCAL_PORT;
+            return false;
+        }
+        config.udp.localPort = static_cast<unsigned short>(number);
         return true;
     default:
         error = L"접속 방식 선택 필요.";
@@ -1107,7 +1115,11 @@ std::wstring App::planWarnings(const std::vector<Plan>& plan) const
         const SerialConfig& serial = entry.settings.transport.serial;
         if (serial.dataBits < 8)
             add(entry.channel, L"데이터 비트 " + std::to_wstring(serial.dataBits) +
-                                   L". C0·C1·FF 등 8비트 전문 바이트 전송 불가.");
+                                   L". 8비트 전문 바이트(C0·C1·FF 등) 전송 불가로 판정 FAIL 예상, 데이터 비트 8 지정 필요.");
+        // 반향 오설정 자동 검출은 송신 완료 대기형 직렬 포트 또는 저속 조건 한정
+        if (serial.standard == SerialStandard::Rs485TwoWire && serial.localEcho == LocalEcho::Absent)
+            add(entry.channel, L"RS-485 2선식 송신 반향 미발생 설정. USB·네트워크 변환기는 송신 반향 오설정 자동 검출 불가, "
+                               L"송신 반향 발생 시 장치 무회신도 정상 판정.");
         // 소요 속도: 평균 전문 × 문자당 비트 ÷ 50ms. RS-485 2선식은 송신·회신이 한 선로 공유
         const double stop = serial.stopBits == ONESTOPBIT ? 1.0 : serial.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
         const double bits = 1.0 + serial.dataBits + (serial.parity != NOPARITY ? 1.0 : 0.0) + stop;
@@ -1116,7 +1128,8 @@ std::wstring App::planWarnings(const std::vector<Plan>& plan) const
             static_cast<unsigned long long>(kMeanFrameBytes * bits / 0.05 * (shared ? 2.0 : 1.0)) + 1;
         if (serial.baud < required)
             add(entry.channel, L"통신 속도 " + grouped(serial.baud) + L" bps. 50 ms 주기 유지 소요 " +
-                                   grouped(required) + L" bps 미달" + (shared ? L" (반이중 송·회신 공유)." : L"."));
+                                   grouped(required) + L" bps 미달" + (shared ? L" (반이중 송·회신 공유)" : L"") +
+                                   L", 판정 FAIL 예상.");
     }
     std::wstring warnings;
     for (const auto& group : groups) warnings += channelRanges(group.second) + L": " + group.first + L"\n";
@@ -1202,7 +1215,7 @@ void App::setChannelCount(std::size_t count)
     refreshSummary();
 }
 
-// 직전 시험 결과 폐기 후 대기 표시 복귀: 판정 패널 시험 시간, 선택 채널 상세, 목록 사후 그리기 열 재도장
+// 직전 시험 결과 폐기 후 대기 표시 복귀: 판정 패널 시험 시간, 선택 채널 상세, 요약, 제목, 목록 사후 그리기 열 무효화
 void App::clearResults()
 {
     for (std::size_t i = 0; i < kMaxChannels; ++i) {
@@ -1212,6 +1225,8 @@ void App::clearResults()
     hasResult_ = false;
     previewDuration();
     refreshDetail();
+    refreshSummary();
+    updateTitle();
     if (list_) InvalidateRect(list_, nullptr, FALSE);
 }
 
@@ -1276,7 +1291,7 @@ void App::showTransportPanel()
     for (int id : kUdpControls) ShowWindow(item(id), kind == kUdp ? SW_SHOW : SW_HIDE);
 }
 
-// 흐름 제어는 RS-232 전용, 송신 반향 선택은 RS-485 2선식 전용(타 방식 선택 중에도 선택값 보존)
+// 흐름 제어는 RS-232 전용(타 방식 선택 시 없음으로 초기화), 송신 반향 선택은 RS-485 2선식 전용(타 방식 선택 중 선택값 보존)
 void App::applySerialRules()
 {
     ChannelForm& form = forms_[selected_];
@@ -1356,13 +1371,13 @@ void App::refreshRows()
         setCell(row, kColSent, shown ? grouped(view.sent) : std::wstring());
         setCell(row, kColMatched, shown ? grouped(view.matched) : std::wstring());
         setCell(row, kColFailed, shown ? grouped(view.failed) : std::wstring());
-        setCell(row, kColLatency, !shown ? std::wstring() : view.matched ? milliseconds(view.maxLatency) : L"—");
+        setCell(row, kColLatency, !shown ? std::wstring() : view.matched ? msText(view.maxLatency) : L"—");
 
         COLORREF face{};
         COLORREF ink{};
         std::wstring label;
         rowVerdict(row, face, ink, label);
-        // 판정·최근 열은 사후 그리기 표시. 판정 변경 또는 시험 중 이력 갱신 시 해당 셀 재도장
+        // 판정·추이 열은 사후 그리기 표시. 판정 변경 또는 시험 중 이력 갱신 시 해당 셀 무효화
         auto& cached = cells_[row][kColVerdict];
         RECT cell{};
         if (cached != label) {
@@ -1370,7 +1385,7 @@ void App::refreshRows()
             if (ListView_GetSubItemRect(list_, static_cast<int>(row), kColVerdict, LVIR_BOUNDS, &cell))
                 InvalidateRect(list_, &cell, FALSE);
         }
-        if (running_ && shown && ListView_GetSubItemRect(list_, static_cast<int>(row), kColRecent, LVIR_BOUNDS, &cell))
+        if (running_ && shown && ListView_GetSubItemRect(list_, static_cast<int>(row), kColTrend, LVIR_BOUNDS, &cell))
             InvalidateRect(list_, &cell, FALSE);
     }
 }
@@ -1383,12 +1398,13 @@ void App::setCell(std::size_t row, int column, const std::wstring& value)
     ListView_SetItemText(list_, static_cast<int>(row), column, cached.data());
 }
 
+// 미시험 채널은 판정 표시 없음(false)
 bool App::rowVerdict(std::size_t row, COLORREF& face, COLORREF& ink, std::wstring& label) const
 {
     face = ui::palette::Muted;
-    ink = ui::palette::TextMuted;
-    label = L"대기";
-    if (!active_[row]) return true;
+    ink = ui::palette::Text;
+    label.clear();
+    if (!active_[row]) return false;
     const TestSnapshot& view = views_[row];
     ink = ui::palette::White;
     if (view.verdict == Verdict::Fail) {
@@ -1402,10 +1418,11 @@ bool App::rowVerdict(std::size_t row, COLORREF& face, COLORREF& ink, std::wstrin
         label = L"OK";
     } else if (view.verdict == Verdict::Stopped) {
         face = ui::palette::Halted;
-        label = L"중지";
+        label = L"보류";
     } else {
         face = ui::palette::Muted;
-        ink = ui::palette::TextMuted;
+        ink = ui::palette::Text;
+        label = L"대기";
     }
     return true;
 }
@@ -1429,8 +1446,8 @@ LRESULT App::onListCustomDraw(NMLVCUSTOMDRAW& draw)
         if (rowVerdict(row, face, ink, label) &&
             ListView_GetSubItemRect(list_, static_cast<int>(row), kColVerdict, LVIR_BOUNDS, &cell))
             ui::paintPill(draw.nmcd.hdc, cell, fonts_, base, face, ink, label);
-        if (active_[row] && ListView_GetSubItemRect(list_, static_cast<int>(row), kColRecent, LVIR_BOUNDS, &cell))
-            ui::paintSparkline(draw.nmcd.hdc, cell, base, views_[row].recent);
+        if (active_[row] && ListView_GetSubItemRect(list_, static_cast<int>(row), kColTrend, LVIR_BOUNDS, &cell))
+            ui::paintTimeline(draw.nmcd.hdc, cell, base, views_[row].timeline);
         return CDRF_DODEFAULT;
     }
     default:
@@ -1438,12 +1455,36 @@ LRESULT App::onListCustomDraw(NMLVCUSTOMDRAW& draw)
     }
 }
 
+// 목록 밖으로 스크롤된 채널 포함 판정별 채널 수
 void App::refreshSummary()
 {
-    SetDlgItemTextW(dialog_, IDC_CHANNEL_SUMMARY,
-                    (L"사용 " + std::to_wstring(channelCount_) + L"채널 · 최대 " + std::to_wstring(kMaxChannels) +
-                     L"채널").c_str());
+    std::wstring text = L"사용 " + std::to_wstring(channelCount_) + L"채널";
+    if (running_ || hasResult_) {
+        const Overall result = overall();
+        text += L" · FAIL " + std::to_wstring(result.failedChannels);
+        if (!running_) {
+            text += L" · OK " + std::to_wstring(result.passed);
+            if (result.stopped) text += L" · 보류 " + std::to_wstring(result.stopped);
+        }
+    }
+    if (text != summaryText_) {
+        summaryText_ = text;
+        SetDlgItemTextW(dialog_, IDC_CHANNEL_SUMMARY, summaryText_.c_str());
+    }
     if (!running_) InvalidateRect(item(IDC_VERDICT), nullptr, FALSE);
+}
+
+// 제목 표시줄 판정 상태. 최소화·가림 상태에서도 작업 표시줄로 확인
+void App::updateTitle()
+{
+    std::wstring title = kAppTitle;
+    if (running_ || hasResult_) {
+        const ui::VerdictView view = verdictView();
+        title += L" · " + view.state + (view.percent.empty() ? std::wstring() : L" " + view.percent);
+    }
+    if (title == titleText_) return;
+    titleText_ = title;
+    SetWindowTextW(dialog_, titleText_.c_str());
 }
 
 void App::refreshDetail()
@@ -1508,29 +1549,50 @@ void App::appendLog(const std::wstring& line, std::chrono::system_clock::time_po
     SendMessageW(log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(entry.c_str()));
 }
 
-void App::appendChannelEvents(std::size_t channel, const std::vector<TestEvent>& events)
+// 전 채널 기록을 발생 시각 순으로 병합 기록
+void App::appendEvents()
 {
-    for (const auto& event : events) appendLog(channelName(channel) + L" · " + event.text, event.wall);
+    std::vector<std::pair<std::size_t, TestEvent>> batch;
+    for (std::size_t i = 0; i < kMaxChannels; ++i) {
+        if (!tests_[i]) continue;
+        for (auto& event : tests_[i]->takeEvents()) batch.emplace_back(i, std::move(event));
+    }
+    std::stable_sort(batch.begin(), batch.end(),
+                     [](const auto& a, const auto& b) { return a.second.wall < b.second.wall; });
+    for (const auto& entry : batch) appendLog(channelName(entry.first) + L" · " + entry.second.text, entry.second.wall);
 }
 
 void App::refreshFonts()
 {
-    LOGFONTW lf{};
-    lf.lfHeight = -ui::basePixels(dialog_);
-    lf.lfWeight = FW_BOLD;
-    lf.lfCharSet = DEFAULT_CHARSET;
-    lf.lfQuality = CLEARTYPE_QUALITY;
-    lstrcpynW(lf.lfFaceName, L"Malgun Gothic", LF_FACESIZE);
-    const HFONT font = CreateFontIndirectW(&lf);
+    const HFONT font = fonts_.get(ui::basePixels(dialog_), FW_BOLD);
     if (!font) return;
     for (int id : kSections) SendMessageW(item(id), WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-    if (sectionFont_) DeleteObject(sectionFont_);
-    sectionFont_ = font;
 }
 
-void App::invalidatePanels()
+void App::invalidateVerdict()
 {
     InvalidateRect(item(IDC_VERDICT), nullptr, FALSE);
+}
+
+// 시험 중 프로세스 우선순위 상향, 작업 집합 상주 하한 설정. 타 프로그램 부하·메모리 회수에 의한 송신 주기 지연 방지
+void App::holdProcessResources()
+{
+    const HANDLE process = GetCurrentProcess();
+    const DWORD priority = GetPriorityClass(process);
+    if (priority == NORMAL_PRIORITY_CLASS && SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS)) {
+        savedPriority_ = priority;
+        priorityRaised_ = true;
+    }
+    SIZE_T minimum = 0;
+    SIZE_T maximum = 0;
+    DWORD flags = 0;
+    if (!GetProcessWorkingSetSizeEx(process, &minimum, &maximum, &flags)) return;
+    const SIZE_T resident = (std::max)(minimum, kResidentBytes);
+    if (SetProcessWorkingSetSizeEx(process, resident, (std::max)(maximum, resident * 4),
+                                   QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        savedWorkingSet_ = {minimum, maximum, flags};
+        workingSetHeld_ = true;
+    }
 }
 
 void App::releaseSystemHolds()
@@ -1542,6 +1604,15 @@ void App::releaseSystemHolds()
     if (sleepBlocked_) {
         SetThreadExecutionState(ES_CONTINUOUS);
         sleepBlocked_ = false;
+    }
+    if (priorityRaised_) {
+        SetPriorityClass(GetCurrentProcess(), savedPriority_);
+        priorityRaised_ = false;
+    }
+    if (workingSetHeld_) {
+        SetProcessWorkingSetSizeEx(GetCurrentProcess(), savedWorkingSet_.minimum, savedWorkingSet_.maximum,
+                                   savedWorkingSet_.flags);
+        workingSetHeld_ = false;
     }
 }
 
@@ -1555,7 +1626,6 @@ App::Overall App::overall() const
         ++result.channels;
         result.matched += view.matched;
         result.elapsed = (std::max)(result.elapsed, view.elapsed);
-        result.running = result.running || view.running;
         if (view.verdict == Verdict::Fail) {
             ++result.failedChannels;
             failed.push_back(i);
@@ -1598,9 +1668,12 @@ ui::VerdictView App::verdictView() const
     } else if (result.failedChannels) {
         view.color = ui::palette::Fault;
         view.state = L"FAIL";
-        view.detail = L"FAIL " + std::to_wstring(result.failedChannels) + L"채널 (" + result.failedList + L") · 최초 " +
-                      channelName(result.firstFailureChannel) + L" " + clockText(result.firstFailureAt) + L" " +
-                      result.firstFailure + (running_ ? L" · 시험 계속" : L"");
+        // 진행 여부를 선두 배치. 채널 목록은 3채널 이하만 표기(전체는 목록·기록 참조)
+        std::wstring first = result.firstFailure;
+        if (!first.empty() && first.back() == L'.') first.pop_back();
+        view.detail = (running_ ? L"시험 계속 · FAIL " : L"FAIL ") + std::to_wstring(result.failedChannels) + L"채널" +
+                      (result.failedChannels <= 3 ? L" (" + result.failedList + L")" : std::wstring()) + L" · 최초 " +
+                      channelName(result.firstFailureChannel) + L" " + clockText(result.firstFailureAt) + L" " + first;
     } else if (running_) {
         view.color = ui::palette::Running;
         view.state = L"시험 중";
@@ -1608,8 +1681,8 @@ ui::VerdictView App::verdictView() const
                       L"건 · " + (elapsed >= total ? std::wstring(L"잔여 회신 대기") : L"잔여 " + clockText(total - elapsed));
     } else if (result.stopped) {
         view.color = ui::palette::Halted;
-        view.state = L"중지";
-        view.detail = L"시험 시간 미완료 · 판정 보류";
+        view.state = L"보류";
+        view.detail = L"사용자 중지 · 시험 시간 미완료";
     } else {
         view.color = ui::palette::Pass;
         view.state = L"OK";
@@ -1625,12 +1698,12 @@ std::wstring App::channelDetail() const
     if (!active_[selected_]) return name + L"시험 이력 없음.";
     const TestSnapshot& view = views_[selected_];
     const std::wstring latency = view.matched
-                                     ? L"최대 지연 " + milliseconds(view.maxLatency) + L" · 평균 " + milliseconds(view.meanLatency)
+                                     ? L"최대 지연 " + msText(view.maxLatency) + L" · 평균 " + msText(view.meanLatency)
                                      : std::wstring(L"정상 회신 없음");
-    const std::wstring failure = !view.abortReason.empty() ? L"시험 중단: " + view.abortReason
-                                 : view.hasFailure ? L"최초 실패 " + clockText(view.firstFailureAt, true) + L" · " + view.firstFailure
-                                                   : std::wstring(L"실패 없음");
-    return name + latency + L"\n" + failure;
+    const std::wstring failure = !view.abortReason.empty() ? L"시험 중단 · " + view.abortReason
+                                 : view.hasFailure ? L"최초 이상 " + clockText(view.firstFailureAt, true) + L" · " + view.firstFailure
+                                                   : std::wstring(L"이상 없음");
+    return name + L"수신 " + grouped(view.received) + L"건 · " + latency + L"\n" + failure;
 }
 
 int App::dluToPixels(int units) const

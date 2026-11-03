@@ -44,8 +44,8 @@ std::uint16_t crc16(const Byte* data, std::size_t size);
 void randomData(Data& out);
 
 // DLE 치환: 0x02 → 80 82, 0x03 → 80 83, 0x80 → 80 80
-// 반환 전문: STX | 치환 본문 | ETX
-Buffer buildFrame(const Data& data);
+// out: STX | 치환 본문 | ETX. 기존 용량 재사용으로 송신 주기당 힙 할당 없음
+void buildFrame(const Data& data, Buffer& out);
 
 enum class Parse { NeedMore, Ok, Invalid };
 enum class FrameError { None, Resync, Escape, Length, Header, Trailer, Crc };
@@ -56,11 +56,11 @@ struct ParseResult {
     std::size_t discarded = 0;  // STX 이전 폐기 바이트 수
 };
 
-// 수신 버퍼 선두의 전문 1건 해석.
+// 수신 버퍼 선두의 전문 1건 해석
 //   STX 이전 바이트: discarded 보고 후 폐기
-//   Ok·Invalid: ETX까지 소비. 원시 STX 출현 시 직전까지, 경계 없이 296B(최대 길이 4배) 초과 시 해당 지점까지 소비
+//   Ok·Invalid: ETX까지 소비. 원시 STX 출현 시 직전까지, 경계 없이 296B(최대 길이 4배) 도달 시 296B 소비
 //   NeedMore: 미완 전문 보존
-// 원시 STX·ETX는 본문 내 출현 불가이므로 DLE 직후라도 전문 경계로 판정.
+// 원시 STX·ETX는 본문 내 출현 불가. DLE 직후라도 전문 경계로 판정
 ParseResult parseFrame(Buffer& inOut, Data& dataOut);
 
 }  // namespace loopback
