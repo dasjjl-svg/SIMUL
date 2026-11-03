@@ -16,7 +16,7 @@ struct SerialConfig {
     std::wstring port = L"COM101";
     DWORD baud = 115200;
     BYTE  dataBits = 8;
-    BYTE  parity = NOPARITY;
+    BYTE  parity   = NOPARITY;
     BYTE  stopBits = ONESTOPBIT;
 };
 
@@ -39,7 +39,6 @@ struct TransportConfig {
     UdpConfig    udp;
 };
 
-// Common read/write interface for all three physical transports.
 class Transport {
 public:
     virtual ~Transport() = default;

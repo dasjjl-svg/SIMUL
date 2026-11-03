@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "SIMUL targets Windows only.")
+    message(FATAL_ERROR "Windows 전용.")
 endif()
 
 if(MSVC)
@@ -36,6 +36,7 @@ target_link_libraries(simul PRIVATE
     comctl32
     ws2_32
     shell32
+    shlwapi
     advapi32
     user32
     gdi32

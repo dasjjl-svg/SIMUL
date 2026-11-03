@@ -51,6 +51,7 @@ void addCandidate(std::vector<std::wstring>& out, std::set<std::wstring>& seen, 
     if (path.size() > 1 && path.front() == L'"' && path.back() == L'"')
         path = path.substr(1, path.size() - 2);
     if (path.find(L'"') != std::wstring::npos || path.size() >= 32768) return;
+    // 동명 실행 파일 혼동 방지: 절대 경로만 허용
     const bool absolute = path.size() > 2 && path[1] == L':' &&
                           (path[2] == L'\\' || path[2] == L'/');
     const bool unc = path.compare(0, 2, L"\\\\") == 0;
@@ -134,14 +135,12 @@ VspeResult launchVspe(HWND owner, const std::vector<VspePair>& pairs,
     VspeResult result;
     std::wstring executable = executableOverride.empty() ? findVspeExecutable() : executableOverride;
     if (executable.empty() || !fileExists(executable)) {
-        result.message = L"VSPE executable not found. Install VSPE 1.5.8.489 or newer, "
-                         L"or configure the virtual COM pair manually.";
+        result.message = L"VSPE 실행 파일 미검출. 설치 또는 가상 포트 쌍 수동 설정 필요.";
         return result;
     }
     const std::wstring arguments = buildVspeArguments(pairs);
     if (arguments.empty()) {
-        result.message = L"Nothing to request from VSPE. Pair numbers must be in COM1..COM4096 "
-                         L"and must differ.";
+        result.message = L"포트 쌍 지정 오류. COM1~COM4096 범위, 상호 상이 번호 필요.";
         return result;
     }
     const auto slash = executable.find_last_of(L"\\/");
@@ -159,16 +158,15 @@ VspeResult launchVspe(HWND owner, const std::vector<VspePair>& pairs,
     if (!ShellExecuteExW(&info)) {
         const DWORD code = GetLastError();
         if (code != ERROR_CANCELLED) {
-            // Retry elevated: VSPE needs admin to create devices.
+            // 가상 장치 등록은 관리자 권한 요구
             info.fMask |= SEE_MASK_FLAG_NO_UI;
             info.lpVerb = L"runas";
             if (!ShellExecuteExW(&info)) {
-                result.message = L"Failed to launch VSPE. Error " +
-                                 std::to_wstring(GetLastError());
+                result.message = L"VSPE 실행 실패 (오류 " + std::to_wstring(GetLastError()) + L")";
                 return result;
             }
         } else {
-            result.message = L"VSPE launch cancelled.";
+            result.message = L"VSPE 실행 취소.";
             return result;
         }
     }
@@ -176,8 +174,7 @@ VspeResult launchVspe(HWND owner, const std::vector<VspePair>& pairs,
 
     result.launched = true;
     result.executable = executable;
-    result.message = L"VSPE launched to create the requested pair(s). "
-                     L"Check the VSPE window for status.";
+    result.message = L"VSPE 가상 포트 생성 명령 전달. VSPE 창에서 결과 확인.";
     return result;
 }
 

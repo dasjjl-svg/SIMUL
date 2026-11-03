@@ -10,10 +10,10 @@ LoopbackTest::~LoopbackTest() { stop(); }
 
 bool LoopbackTest::start(const TestSettings& settings, std::wstring& error)
 {
-    if (running_.load()) { error = L"Test already running."; return false; }
+    if (running_.load()) { error = L"시험 실행 중."; return false; }
     settings_ = settings;
     transport_ = makeTransport(settings.transport);
-    if (!transport_) { error = L"Unknown transport."; return false; }
+    if (!transport_) { error = L"접속 방식 미지원."; return false; }
     if (!transport_->open(error)) { transport_.reset(); return false; }
 
     {
@@ -64,7 +64,7 @@ void LoopbackTest::run()
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_.failed == 0 && state_.verdict == Verdict::Pending) {
                 state_.verdict = Verdict::Ok;
-                state_.lastEvent = L"Duration reached. All frames matched.";
+                state_.lastEvent = L"시험 시간 완료, 전 프레임 일치.";
             }
             state_.running = false;
             state_.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -81,7 +81,7 @@ void LoopbackTest::run()
                 std::lock_guard<std::mutex> lock(mutex_);
                 state_.lastError = error;
                 state_.verdict = Verdict::Fail;
-                state_.lastEvent = L"Transport send error: " + error;
+                state_.lastEvent = L"송신 오류: " + error;
                 state_.running = false;
                 break;
             }
@@ -91,7 +91,7 @@ void LoopbackTest::run()
                 if (pending_.size() >= pendingLimit) {
                     ++state_.failed;
                     state_.verdict = Verdict::Fail;
-                    state_.lastEvent = L"Pending queue overflow; no echo received in time.";
+                    state_.lastEvent = L"미회신 적재 상한 초과: 반송 지연 또는 손실.";
                     pending_.pop_front();
                 }
                 pending_.push_back(data);
@@ -105,7 +105,7 @@ void LoopbackTest::run()
             std::lock_guard<std::mutex> lock(mutex_);
             state_.lastError = rxError;
             state_.verdict = Verdict::Fail;
-            state_.lastEvent = L"Transport receive error: " + rxError;
+            state_.lastEvent = L"수신 오류: " + rxError;
             state_.running = false;
             break;
         }
@@ -119,13 +119,15 @@ void LoopbackTest::run()
             if (parsed == Parse::Invalid) {
                 ++state_.failed;
                 state_.verdict = Verdict::Fail;
-                state_.lastEvent = L"Invalid or corrupt frame received.";
+                state_.lastEvent = L"비정상 전문 수신 (프레임·CRC 불량).";
+                // 송·수신 적재 정합 유지
+                if (!pending_.empty()) pending_.pop_front();
                 continue;
             }
             if (pending_.empty()) {
                 ++state_.failed;
                 state_.verdict = Verdict::Fail;
-                state_.lastEvent = L"Received frame with no outstanding transmission.";
+                state_.lastEvent = L"미송신 상태에서 전문 수신.";
                 continue;
             }
             const Data expected = pending_.front();
@@ -133,16 +135,11 @@ void LoopbackTest::run()
             if (got != expected) {
                 ++state_.failed;
                 state_.verdict = Verdict::Fail;
-                state_.lastEvent = L"Received DATA does not match transmitted DATA.";
+                state_.lastEvent = L"송·수신 DATA 상이.";
             }
         }
 
-        if (!cancel_.load()) {
-            // Light sleep to keep the loop responsive without burning CPU.
-            // We time the next send against the wall clock, so this sleep
-            // does not drift the 50 ms cadence.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        if (!cancel_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -150,7 +147,7 @@ void LoopbackTest::run()
     state_.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startedAt_);
     if (state_.verdict == Verdict::Pending && state_.failed == 0 && cancel_.load()) {
-        state_.lastEvent = L"Stopped by user before duration reached.";
+        state_.lastEvent = L"사용자 중지 (완료 전).";
     }
 }
 

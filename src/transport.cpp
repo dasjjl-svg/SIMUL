@@ -20,13 +20,13 @@ void ensureWinsock()
     (void)boot;
 }
 
-std::wstring winsockMessage(const wchar_t* prefix, int code)
+std::wstring systemMessage(const wchar_t* prefix, int code)
 {
     wchar_t buffer[256]{};
     FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
                    static_cast<DWORD>(code), 0, buffer, static_cast<DWORD>(std::size(buffer)), nullptr);
     std::wstring text = prefix;
-    text += L" (";
+    text += L" (오류 ";
     text += std::to_wstring(code);
     text += L") ";
     text += buffer;
@@ -45,7 +45,8 @@ public:
         handle_ = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                               OPEN_EXISTING, 0, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) {
-            error = L"Failed to open " + config_.port + L" (" + std::to_wstring(GetLastError()) + L")";
+            error = L"직렬 포트 열기 실패: " + config_.port +
+                    L" (오류 " + std::to_wstring(GetLastError()) + L")";
             return false;
         }
         DCB dcb{};
@@ -58,7 +59,8 @@ public:
         dcb.fParity  = config_.parity != NOPARITY;
         dcb.fDtrControl = DTR_CONTROL_ENABLE;
         dcb.fRtsControl = RTS_CONTROL_ENABLE;
-        dcb.XonChar = 0x11;
+        // 동일 XON·XOFF 바이트 거부 회피
+        dcb.XonChar  = 0x11;
         dcb.XoffChar = 0x13;
 
         COMMTIMEOUTS timeouts{};
@@ -67,7 +69,7 @@ public:
 
         if (!SetCommState(handle_, &dcb) || !SetCommTimeouts(handle_, &timeouts) ||
             !PurgeComm(handle_, PURGE_RXCLEAR | PURGE_TXCLEAR)) {
-            error = L"Serial port configuration failed (" + std::to_wstring(GetLastError()) + L")";
+            error = L"직렬 포트 설정 실패 (오류 " + std::to_wstring(GetLastError()) + L")";
             close();
             return false;
         }
@@ -84,11 +86,11 @@ public:
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        if (!isOpen()) { error = L"Serial port is not open."; return false; }
+        if (!isOpen()) { error = L"직렬 포트 미연결."; return false; }
         DWORD written = 0;
         if (!WriteFile(handle_, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr) ||
             written != frame.size()) {
-            error = L"Serial write failed (" + std::to_wstring(GetLastError()) + L")";
+            error = L"직렬 송신 실패 (오류 " + std::to_wstring(GetLastError()) + L")";
             return false;
         }
         return true;
@@ -96,15 +98,15 @@ public:
 
     bool receive(Buffer& inOut, std::wstring& error) override
     {
-        if (!isOpen()) { error = L"Serial port is not open."; return false; }
+        if (!isOpen()) { error = L"직렬 포트 미연결."; return false; }
         DWORD errors = 0;
         COMSTAT status{};
         if (!ClearCommError(handle_, &errors, &status)) {
-            error = L"Serial status read failed (" + std::to_wstring(GetLastError()) + L")";
+            error = L"회선 상태 조회 실패 (오류 " + std::to_wstring(GetLastError()) + L")";
             return false;
         }
         if (errors & (CE_FRAME | CE_OVERRUN | CE_RXPARITY | CE_RXOVER)) {
-            error = L"Serial line error flags 0x" + std::to_wstring(errors);
+            error = L"회선 오류 플래그 0x" + std::to_wstring(errors);
             return false;
         }
         if (!status.cbInQue) return true;
@@ -112,7 +114,7 @@ public:
         const DWORD toRead = (std::min)(status.cbInQue, static_cast<DWORD>(chunk.size()));
         DWORD got = 0;
         if (!ReadFile(handle_, chunk.data(), toRead, &got, nullptr)) {
-            error = L"Serial read failed (" + std::to_wstring(GetLastError()) + L")";
+            error = L"직렬 수신 실패 (오류 " + std::to_wstring(GetLastError()) + L")";
             return false;
         }
         inOut.insert(inOut.end(), chunk.begin(), chunk.begin() + got);
@@ -135,25 +137,25 @@ public:
         ensureWinsock();
         socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
-            error = winsockMessage(L"TCP socket() failed", WSAGetLastError());
+            error = systemMessage(L"TCP 소켓 생성 실패", WSAGetLastError());
             return false;
         }
         sockaddr_in address{};
         address.sin_family = AF_INET;
-        address.sin_port = htons(config_.port);
+        address.sin_port   = htons(config_.port);
         if (InetPtonA(AF_INET, config_.host.c_str(), &address.sin_addr) != 1) {
-            error = L"Invalid TCP host address.";
+            error = L"TCP 상대 IPv4 주소 형식 오류.";
             close();
             return false;
         }
         if (connect(socket_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-            error = winsockMessage(L"TCP connect failed", WSAGetLastError());
+            error = systemMessage(L"TCP 접속 실패", WSAGetLastError());
             close();
             return false;
         }
         u_long nonblocking = 1;
         if (ioctlsocket(socket_, FIONBIO, &nonblocking) != 0) {
-            error = winsockMessage(L"TCP ioctlsocket failed", WSAGetLastError());
+            error = systemMessage(L"TCP 비동기 전환 실패", WSAGetLastError());
             close();
             return false;
         }
@@ -170,26 +172,31 @@ public:
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        if (!isOpen()) { error = L"TCP socket is not open."; return false; }
+        if (!isOpen()) { error = L"TCP 소켓 미연결."; return false; }
         std::size_t offset = 0;
-        while (offset < frame.size()) {
+        // 50ms 주기 44B 전문은 수회 재시도 내 완료
+        for (int retry = 0; offset < frame.size() && retry < 100; ++retry) {
             const int sent = ::send(socket_,
                 reinterpret_cast<const char*>(frame.data() + offset),
                 static_cast<int>(frame.size() - offset), 0);
             if (sent == SOCKET_ERROR) {
                 const int code = WSAGetLastError();
                 if (code == WSAEWOULDBLOCK) { Sleep(1); continue; }
-                error = winsockMessage(L"TCP send failed", code);
+                error = systemMessage(L"TCP 송신 실패", code);
                 return false;
             }
             offset += static_cast<std::size_t>(sent);
+        }
+        if (offset != frame.size()) {
+            error = L"TCP 송신 재시도 한도 초과.";
+            return false;
         }
         return true;
     }
 
     bool receive(Buffer& inOut, std::wstring& error) override
     {
-        if (!isOpen()) { error = L"TCP socket is not open."; return false; }
+        if (!isOpen()) { error = L"TCP 소켓 미연결."; return false; }
         std::array<Byte, 2048> chunk{};
         for (;;) {
             const int got = recv(socket_, reinterpret_cast<char*>(chunk.data()),
@@ -198,10 +205,10 @@ public:
                 inOut.insert(inOut.end(), chunk.begin(), chunk.begin() + got);
                 continue;
             }
-            if (got == 0) { error = L"TCP peer closed the connection."; return false; }
+            if (got == 0) { error = L"TCP 상대 종료."; return false; }
             const int code = WSAGetLastError();
             if (code == WSAEWOULDBLOCK) return true;
-            error = winsockMessage(L"TCP recv failed", code);
+            error = systemMessage(L"TCP 수신 실패", code);
             return false;
         }
     }
@@ -222,14 +229,14 @@ public:
         ensureWinsock();
         socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (socket_ == INVALID_SOCKET) {
-            error = winsockMessage(L"UDP socket() failed", WSAGetLastError());
+            error = systemMessage(L"UDP 소켓 생성 실패", WSAGetLastError());
             return false;
         }
         sockaddr_in local{};
         local.sin_family = AF_INET;
-        local.sin_port = htons(config_.localPort);
+        local.sin_port   = htons(config_.localPort);
         if (InetPtonA(AF_INET, config_.localHost.c_str(), &local.sin_addr) != 1) {
-            error = L"Invalid UDP local address.";
+            error = L"UDP 수신 IPv4 주소 형식 오류.";
             close();
             return false;
         }
@@ -237,21 +244,21 @@ public:
         if (setsockopt(socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                        reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0 ||
             bind(socket_, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
-            error = winsockMessage(L"UDP bind failed", WSAGetLastError());
+            error = systemMessage(L"UDP 바인드 실패", WSAGetLastError());
             close();
             return false;
         }
         remote_ = {};
         remote_.sin_family = AF_INET;
-        remote_.sin_port = htons(config_.remotePort);
+        remote_.sin_port   = htons(config_.remotePort);
         if (InetPtonA(AF_INET, config_.remoteHost.c_str(), &remote_.sin_addr) != 1) {
-            error = L"Invalid UDP remote address.";
+            error = L"UDP 상대 IPv4 주소 형식 오류.";
             close();
             return false;
         }
         u_long nonblocking = 1;
         if (ioctlsocket(socket_, FIONBIO, &nonblocking) != 0) {
-            error = winsockMessage(L"UDP ioctlsocket failed", WSAGetLastError());
+            error = systemMessage(L"UDP 비동기 전환 실패", WSAGetLastError());
             close();
             return false;
         }
@@ -268,16 +275,16 @@ public:
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        if (!isOpen()) { error = L"UDP socket is not open."; return false; }
+        if (!isOpen()) { error = L"UDP 소켓 미연결."; return false; }
         const int sent = sendto(socket_, reinterpret_cast<const char*>(frame.data()),
             static_cast<int>(frame.size()), 0,
             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
         if (sent == SOCKET_ERROR) {
-            error = winsockMessage(L"UDP sendto failed", WSAGetLastError());
+            error = systemMessage(L"UDP 송신 실패", WSAGetLastError());
             return false;
         }
         if (static_cast<std::size_t>(sent) != frame.size()) {
-            error = L"UDP short write.";
+            error = L"UDP 분할 송신 발생.";
             return false;
         }
         return true;
@@ -285,7 +292,7 @@ public:
 
     bool receive(Buffer& inOut, std::wstring& error) override
     {
-        if (!isOpen()) { error = L"UDP socket is not open."; return false; }
+        if (!isOpen()) { error = L"UDP 소켓 미연결."; return false; }
         for (;;) {
             std::array<Byte, 2048> chunk{};
             sockaddr_in from{};
@@ -298,8 +305,9 @@ public:
                 continue;
             }
             const int code = WSAGetLastError();
+            // WSAECONNRESET: 상대 포트 미개방 ICMP 응답 — 비치명 처리
             if (code == WSAEWOULDBLOCK || code == WSAEMSGSIZE || code == WSAECONNRESET) return true;
-            error = winsockMessage(L"UDP recvfrom failed", code);
+            error = systemMessage(L"UDP 수신 실패", code);
             return false;
         }
     }

@@ -4,56 +4,68 @@
 
 LANGUAGE LANG_KOREAN, SUBLANG_KOREAN
 
-IDD_MAIN DIALOGEX 0, 0, 360, 300
+IDD_MAIN DIALOGEX 0, 0, 420, 350
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
-CAPTION "SIMUL - Loopback Simulator (by Jeongmin Lee)"
+CAPTION "SIMUL  ·  통신선 반송 시험기 (Jeongmin Lee)"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    GROUPBOX        "Transport",                           -1,  7,   7, 346,  70
-    LTEXT           "Interface:",                          -1, 15,  20,  40,  10
-    COMBOBOX        IDC_TRANSPORT_COMBO,                       60,  18, 160,  80,
+    //──────────────────────────── 접속 설정 ────────────────────────────
+    GROUPBOX        "접속 설정",                                  -1, 10,   8, 400,  86
+
+    LTEXT           "접속 방식",                                 -1, 22,  24,  48,  10
+    COMBOBOX        IDC_TRANSPORT_COMBO,                             78,  22, 150,  80,
                     CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL
 
-    LTEXT           "Serial Port:",                        -1, 15,  36,  40,  10
-    EDITTEXT        IDC_SERIAL_PORT,                           60,  34,  60,  12, ES_AUTOHSCROLL
-    LTEXT           "Baud:",                               -1, 128,  36,  22,  10
-    EDITTEXT        IDC_SERIAL_BAUD,                          155,  34,  55,  12, ES_AUTOHSCROLL | ES_NUMBER
-    PUSHBUTTON      "Launch VSPE...",   IDC_VSPE_BUTTON,      220,  33,  80,  14
+    LTEXT           "직렬 포트",                                 -1, 22,  42,  48,  10
+    EDITTEXT        IDC_SERIAL_PORT,                                 78,  40,  60,  13, ES_AUTOHSCROLL
+    LTEXT           "보/속",                                     -1,146,  42,  26,  10
+    EDITTEXT        IDC_SERIAL_BAUD,                                176,  40,  52,  13, ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "가상 포트 생성 (VSPE)",   IDC_VSPE_BUTTON,     238,  39,  96,  15
 
-    LTEXT           "TCP Host:",                           -1, 15,  52,  40,  10
-    EDITTEXT        IDC_TCP_HOST,                              60,  50,  90,  12, ES_AUTOHSCROLL
-    LTEXT           "Port:",                               -1,160,  52,  20,  10
-    EDITTEXT        IDC_TCP_PORT,                             185,  50,  40,  12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "TCP 상대",                                  -1, 22,  60,  48,  10
+    EDITTEXT        IDC_TCP_HOST,                                    78,  58,  90,  13, ES_AUTOHSCROLL
+    LTEXT           "포트",                                      -1,174,  60,  22,  10
+    EDITTEXT        IDC_TCP_PORT,                                   200,  58,  44,  13, ES_AUTOHSCROLL | ES_NUMBER
 
-    LTEXT           "UDP Local:",                          -1, 15,  66,  40,  10
-    EDITTEXT        IDC_UDP_LOCAL_HOST,                        60,  64,  70,  12, ES_AUTOHSCROLL
-    EDITTEXT        IDC_UDP_LOCAL_PORT,                       135,  64,  35,  12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "UDP Remote:",                         -1,180,  66,  44,  10
-    EDITTEXT        IDC_UDP_REMOTE_HOST,                      226,  64,  70,  12, ES_AUTOHSCROLL
-    EDITTEXT        IDC_UDP_REMOTE_PORT,                      300,  64,  35,  12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "UDP 수신",                                  -1, 22,  78,  48,  10
+    EDITTEXT        IDC_UDP_LOCAL_HOST,                              78,  76,  72,  13, ES_AUTOHSCROLL
+    EDITTEXT        IDC_UDP_LOCAL_PORT,                             154,  76,  40,  13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "UDP 송신",                                  -1,208,  78,  48,  10
+    EDITTEXT        IDC_UDP_REMOTE_HOST,                            260,  76,  72,  13, ES_AUTOHSCROLL
+    EDITTEXT        IDC_UDP_REMOTE_PORT,                            336,  76,  40,  13, ES_AUTOHSCROLL | ES_NUMBER
 
-    GROUPBOX        "Test",                                -1,  7,  85, 346,  52
-    LTEXT           "Duration:",                           -1, 15,  98,  40,  10
-    EDITTEXT        IDC_DURATION_HOURS,                        60,  96,  28,  12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "hours",                               -1, 93,  98,  22,  10
-    EDITTEXT        IDC_DURATION_MINUTES,                     118,  96,  28,  12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "minutes (max 72 h)",                  -1,152,  98,  80,  10
+    //──────────────────────────── 시험 조건 ────────────────────────────
+    GROUPBOX        "시험 조건",                                 -1, 10, 100, 400,  34
 
-    DEFPUSHBUTTON   "Start",            IDC_START_BUTTON,     15, 115,  70,  16
-    PUSHBUTTON      "Stop",             IDC_STOP_BUTTON,     100, 115,  70,  16
-    LTEXT           "Sends 32 random bytes every 50 ms, verifies echo.",
-                                                           -1,180, 118, 170,  10
+    LTEXT           "시험 시간",                                 -1, 22, 116,  48,  10
+    EDITTEXT        IDC_DURATION_HOURS,                              78, 114,  28,  13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "시간",                                      -1,110, 116,  18,  10
+    EDITTEXT        IDC_DURATION_MINUTES,                           132, 114,  28,  13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "분   (최대 72 시간)",                       -1,164, 116, 100,  10
+    LTEXT           "송신 주기 50 ms  ·  DATA 32 Byte 랜덤",    -1,260, 116, 140,  10
 
-    GROUPBOX        "Status",                              -1,  7, 143, 346,  60
-    LTEXT           "TEST: idle",       IDC_RESULT_TEXT,     15, 155, 160,  12
-    LTEXT           "",                 IDC_STATUS_TEXT,     15, 170, 330,  12
-    LTEXT           "TX: 0",            IDC_TX_COUNT,        15, 186,  80,  10
-    LTEXT           "RX: 0",            IDC_RX_COUNT,       100, 186,  80,  10
-    LTEXT           "FAIL: 0",          IDC_FAIL_COUNT,     185, 186,  80,  10
-    LTEXT           "0:00:00 / 0:00:00",IDC_ELAPSED_TEXT,   270, 186,  80,  10
+    //──────────────────────────── 결과 배너 ────────────────────────────
+    GROUPBOX        "시험 결과",                                 -1, 10, 140, 400,  58
+    LTEXT           "대 기 중",       IDC_RESULT_TEXT,              18, 154, 384,  38,
+                    SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY
 
-    GROUPBOX        "Log",                                 -1,  7, 207, 346,  85
-    EDITTEXT        IDC_LOG_TEXT,                              15, 220, 330,  65,
+    //──────────────────────────── 계수 ────────────────────────────
+    LTEXT           "송신 0",         IDC_TX_COUNT,                 18, 206,  90,  12
+    LTEXT           "수신 0",         IDC_RX_COUNT,                108, 206,  90,  12
+    LTEXT           "실패 0",         IDC_FAIL_COUNT,              198, 206,  90,  12
+    LTEXT           "경과 0:00:00 / 0:00:00", IDC_ELAPSED_TEXT,    288, 206, 120,  12
+
+    //──────────────────────────── 상태 메시지 ────────────────────────────
+    LTEXT           "접속 방식 선택 후 시험 시작.", IDC_STATUS_TEXT,
+                                                                    18, 222, 384,  10
+
+    //──────────────────────────── 제어 ────────────────────────────
+    DEFPUSHBUTTON   "시험 시작",      IDC_START_BUTTON,            100, 238,  90,  18
+    PUSHBUTTON      "시험 정지",      IDC_STOP_BUTTON,             232, 238,  90,  18
+
+    //──────────────────────────── 시험 기록 ────────────────────────────
+    GROUPBOX        "시험 기록",                                 -1, 10, 262, 400,  82
+    EDITTEXT        IDC_LOG_TEXT,                                    18, 274, 384,  65,
                     ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL
 END
 
@@ -68,7 +80,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName",      "Jeongmin Lee"
-            VALUE "FileDescription",  "SIMUL Loopback Simulator"
+            VALUE "FileDescription",  "SIMUL Loopback Verifier"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "SIMUL"
             VALUE "LegalCopyright",   "Copyright (C) Jeongmin Lee"

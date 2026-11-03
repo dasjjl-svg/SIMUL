@@ -19,7 +19,7 @@ enum class Verdict { Pending, Ok, Fail };
 struct TestSettings {
     TransportConfig transport;
     std::chrono::seconds duration = std::chrono::hours(1);
-    std::chrono::milliseconds interval = std::chrono::milliseconds(50);
+    std::chrono::milliseconds interval = std::chrono::milliseconds(50);  // 송신 주기 50ms 고정
 };
 
 struct TestSnapshot {
@@ -34,18 +34,9 @@ struct TestSnapshot {
     std::wstring lastEvent;
 };
 
-// Timed loopback runner. One worker thread drives both TX and RX.
-//
-// Behaviour:
-//   * Every `interval` (50 ms) a random 32-byte DATA block is wrapped in
-//     a frame and sent through the transport.
-//   * Each transmitted DATA block is recorded as expected.
-//   * Received frames are matched to the oldest expected block that is
-//     still outstanding; a mismatch, CRC error, or missing frame beyond
-//     the window counts as a failure.
-//   * Any single failure sets the verdict to Fail; the run also ends
-//     early if the transport reports an error.
-//   * When `duration` elapses with zero failures, the verdict is Ok.
+// 반송 시험 러너. 작업 스레드 1개가 송·수신 양방향 처리.
+// 한 건이라도 수신 전문이 송신 적재와 상이하면 verdict=Fail.
+// duration 완료 시 failed==0 이면 verdict=Ok.
 class LoopbackTest {
 public:
     LoopbackTest();
@@ -68,10 +59,11 @@ private:
 
     mutable std::mutex mutex_;
     TestSnapshot state_{};
-    std::deque<Data> pending_;              // DATA blocks awaiting echo
+    std::deque<Data> pending_;
     Buffer rxBuffer_;
     std::chrono::steady_clock::time_point startedAt_{};
 
+    // 미회신 적재 상한. 20Hz × 6.4s = 128프레임
     static constexpr std::size_t pendingLimit = 128;
 };
 

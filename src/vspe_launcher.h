@@ -7,14 +7,9 @@
 
 namespace simul {
 
-// Minimal helper that drives the Virtual Serial Ports Emulator (VSPE)
-// command line to create one or more virtual COM port pairs.
-//
-// Install VSPE separately. SIMUL does not bundle, modify, or distribute it.
-
 struct VspePair {
-    unsigned firstPort = 0;   // e.g. 101 -> COM101
-    unsigned secondPort = 0;
+    unsigned firstPort = 0;   // COM<firstPort>
+    unsigned secondPort = 0;  // COM<secondPort>
 };
 
 struct VspeResult {
@@ -23,16 +18,13 @@ struct VspeResult {
     std::wstring message;
 };
 
-// Searches common installation locations and registry entries for
-// VSPEmulator.exe. Empty return means no suitable install was found.
+// 설치 레지스트리·연결 프로그램·기본 Program Files 경로 순차 탐색
 std::wstring findVspeExecutable();
 
-// Build the command-line arguments for the requested pairs.
+// Pair;first;second;0 명령 인수 생성. 입력 오류 시 공백 반환.
 std::wstring buildVspeArguments(const std::vector<VspePair>& pairs);
 
-// Launch VSPE to create the requested pairs. Returns immediately once the
-// process has been started (the UI should poll COM port presence
-// separately if confirmation matters).
+// VSPEmulator.exe 실행 후 즉시 반환. 포트 활성 확인은 상위 UI에서 처리.
 VspeResult launchVspe(HWND owner, const std::vector<VspePair>& pairs,
                       const std::wstring& executableOverride = {});
 

@@ -20,7 +20,6 @@ std::uint16_t crc16(const Byte* data, std::size_t size)
 
 void randomData(Data& out)
 {
-    // thread_local keeps the generator warm between 50 ms calls.
     thread_local std::random_device seed;
     thread_local std::mt19937 engine(seed());
     std::uniform_int_distribution<unsigned> dist(0x00, 0xFF);
@@ -49,7 +48,7 @@ Buffer buildFrame(const Data& data)
     payload.push_back(HEADER_LO);
     payload.insert(payload.end(), data.begin(), data.end());
 
-    // CRC covers the C0 C1 marker plus the 32-byte DATA.
+    // CRC 범위: C0C1 + DATA(32)
     const std::uint16_t crc = crc16(payload.data(), payload.size());
     payload.push_back(static_cast<Byte>((crc >> 8) & 0xFF));
     payload.push_back(static_cast<Byte>(crc & 0xFF));
@@ -67,7 +66,6 @@ Buffer buildFrame(const Data& data)
 
 Parse parseFrame(Buffer& inOut, Data& dataOut)
 {
-    // Drop everything before the first STX.
     auto firstStx = std::find(inOut.begin(), inOut.end(), STX);
     if (firstStx != inOut.begin()) inOut.erase(inOut.begin(), firstStx);
     if (inOut.empty()) return Parse::NeedMore;
@@ -75,7 +73,7 @@ Parse parseFrame(Buffer& inOut, Data& dataOut)
     Buffer payload;
     payload.reserve(PAYLOAD_SIZE);
     bool escaping = false;
-    std::size_t consumed = 1;  // skip leading STX
+    std::size_t consumed = 1;
     bool frameClosed = false;
     bool valid = true;
 
@@ -83,9 +81,8 @@ Parse parseFrame(Buffer& inOut, Data& dataOut)
         const Byte b = inOut[i];
         ++consumed;
 
+        // 중첩 STX: 재동기화를 위해 선행 전문 폐기, 신규 STX 보존
         if (b == STX && !escaping) {
-            // Unexpected restart — treat the previous attempt as invalid and
-            // keep the new STX for the next pass.
             --consumed;
             inOut.erase(inOut.begin(), inOut.begin() + static_cast<long>(consumed));
             return Parse::Invalid;
@@ -95,7 +92,6 @@ Parse parseFrame(Buffer& inOut, Data& dataOut)
 
         if (escaping) {
             escaping = false;
-            // Allowed escaped bytes: 0x80 0x82, 0x80 0x83, 0x80 0x80.
             if (b == 0x82) payload.push_back(STX);
             else if (b == 0x83) payload.push_back(ETX);
             else if (b == 0x80) payload.push_back(DLE);
@@ -110,7 +106,6 @@ Parse parseFrame(Buffer& inOut, Data& dataOut)
 
     if (!frameClosed && valid) return Parse::NeedMore;
 
-    // Consume whatever we scanned, closing byte included if any.
     inOut.erase(inOut.begin(), inOut.begin() + static_cast<long>(consumed));
 
     if (!frameClosed || !valid) return Parse::Invalid;

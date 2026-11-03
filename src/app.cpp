@@ -17,13 +17,19 @@ namespace simul {
 namespace {
 
 constexpr UINT_PTR kStatusTimer = 1;
-constexpr UINT kStatusIntervalMs = 100;
+constexpr UINT     kStatusIntervalMs = 100;
 
 constexpr const wchar_t* kTransportNames[] = {
-    L"Serial (Com0Com / VSPE)",
+    L"직렬 (Com0Com / VSPE)",
     L"TCP",
     L"UDP",
 };
+
+// 배너 상태 색상
+constexpr COLORREF kIdleBg   = RGB( 55,  65,  81);   // slate-700
+constexpr COLORREF kRunBg    = RGB(217, 119,   6);   // amber-600
+constexpr COLORREF kOkBg     = RGB( 22, 163,  74);   // green-600
+constexpr COLORREF kFailBg   = RGB(220,  38,  38);   // red-600
 
 void setText(HWND dialog, int id, const std::wstring& text)
 {
@@ -59,12 +65,16 @@ bool parseUnsigned(const std::wstring& text, unsigned long& out, unsigned long l
     return true;
 }
 
+// IPv4 문자열 변환 (ASCII 범위 보장)
 std::string wideToNarrow(const std::wstring& s)
 {
-    std::string result;
-    result.reserve(s.size());
-    for (wchar_t c : s) result.push_back(static_cast<char>(c));
-    return result;
+    if (s.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1,
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string narrow(static_cast<std::size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, narrow.data(), size, nullptr, nullptr);
+    return narrow;
 }
 
 std::wstring formatDuration(std::chrono::milliseconds elapsed)
@@ -81,25 +91,46 @@ std::wstring formatDuration(std::chrono::milliseconds elapsed)
     return buffer;
 }
 
-std::wstring verdictText(Verdict verdict)
+std::wstring verdictBanner(Verdict verdict, bool running)
 {
+    if (running) return L"시 험 중";
     switch (verdict) {
-    case Verdict::Ok:   return L"OK";
-    case Verdict::Fail: return L"FAIL";
-    default:            return L"...";
+    case Verdict::Ok:   return L"O  K";
+    case Verdict::Fail: return L"F A I L";
+    default:            return L"대 기 중";
     }
+}
+
+HFONT makeBannerFont()
+{
+    LOGFONTW lf{};
+    lf.lfHeight  = -28;
+    lf.lfWeight  = FW_SEMIBOLD;
+    lf.lfCharSet = HANGUL_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    wcsncpy_s(lf.lfFaceName, L"Segoe UI Semibold", _TRUNCATE);
+    return CreateFontIndirectW(&lf);
 }
 
 }  // namespace
 
 App::App() = default;
-App::~App() { if (test_) test_->stop(); }
+
+App::~App()
+{
+    if (test_) test_->stop();
+    if (bannerFont_) DeleteObject(bannerFont_);
+    if (idleBrush_)  DeleteObject(idleBrush_);
+    if (runBrush_)   DeleteObject(runBrush_);
+    if (okBrush_)    DeleteObject(okBrush_);
+    if (failBrush_)  DeleteObject(failBrush_);
+}
 
 int App::run(HINSTANCE instance, int /*showCommand*/)
 {
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
+    icc.dwICC  = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
 
     return static_cast<int>(DialogBoxParamW(instance,
@@ -135,6 +166,18 @@ INT_PTR App::handle(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
         onTimer(dialog, static_cast<UINT_PTR>(wParam));
         return TRUE;
 
+    case WM_CTLCOLORSTATIC: {
+        HBRUSH brush = onCtlColor(reinterpret_cast<HWND>(lParam));
+        if (brush) {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, activeText_);
+            SetBkColor(dc, GetBkColor(dc));
+            SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<INT_PTR>(brush);
+        }
+        return FALSE;
+    }
+
     case WM_CLOSE:
         if (test_) test_->stop();
         KillTimer(dialog, kStatusTimer);
@@ -148,39 +191,58 @@ INT_PTR App::handle(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
 void App::onInit(HWND dialog)
 {
     HWND transport = GetDlgItem(dialog, IDC_TRANSPORT_COMBO);
-    for (const auto* name : kTransportNames) {
-        ComboBox_AddString(transport, name);
-    }
+    for (const auto* name : kTransportNames) ComboBox_AddString(transport, name);
     ComboBox_SetCurSel(transport, 0);
 
-    setText(dialog, IDC_SERIAL_PORT,       L"COM101");
-    setText(dialog, IDC_SERIAL_BAUD,       L"115200");
-    setText(dialog, IDC_TCP_HOST,          L"127.0.0.1");
-    setText(dialog, IDC_TCP_PORT,          L"50000");
-    setText(dialog, IDC_UDP_LOCAL_HOST,    L"0.0.0.0");
-    setText(dialog, IDC_UDP_LOCAL_PORT,    L"50001");
-    setText(dialog, IDC_UDP_REMOTE_HOST,   L"127.0.0.1");
-    setText(dialog, IDC_UDP_REMOTE_PORT,   L"50000");
-    setText(dialog, IDC_DURATION_HOURS,    L"1");
-    setText(dialog, IDC_DURATION_MINUTES,  L"0");
+    setText(dialog, IDC_SERIAL_PORT,      L"COM101");
+    setText(dialog, IDC_SERIAL_BAUD,      L"115200");
+    setText(dialog, IDC_TCP_HOST,         L"127.0.0.1");
+    setText(dialog, IDC_TCP_PORT,         L"50000");
+    setText(dialog, IDC_UDP_LOCAL_HOST,   L"0.0.0.0");
+    setText(dialog, IDC_UDP_LOCAL_PORT,   L"50001");
+    setText(dialog, IDC_UDP_REMOTE_HOST,  L"127.0.0.1");
+    setText(dialog, IDC_UDP_REMOTE_PORT,  L"50000");
+    setText(dialog, IDC_DURATION_HOURS,   L"1");
+    setText(dialog, IDC_DURATION_MINUTES, L"0");
 
-    setText(dialog, IDC_RESULT_TEXT, L"TEST: idle");
-    setText(dialog, IDC_STATUS_TEXT, L"Pick a transport and press Start.");
-    setText(dialog, IDC_TX_COUNT, L"TX: 0");
-    setText(dialog, IDC_RX_COUNT, L"RX: 0");
-    setText(dialog, IDC_FAIL_COUNT, L"FAIL: 0");
-    setText(dialog, IDC_ELAPSED_TEXT, L"0:00:00 / 0:00:00");
+    setText(dialog, IDC_TX_COUNT,     L"송신 0");
+    setText(dialog, IDC_RX_COUNT,     L"수신 0");
+    setText(dialog, IDC_FAIL_COUNT,   L"실패 0");
+    setText(dialog, IDC_ELAPSED_TEXT, L"경과 0:00:00 / 0:00:00");
+
+    // 배너 전용 큰 글꼴·상태 브러시
+    bannerFont_ = makeBannerFont();
+    if (bannerFont_)
+        SendMessageW(GetDlgItem(dialog, IDC_RESULT_TEXT), WM_SETFONT,
+                     reinterpret_cast<WPARAM>(bannerFont_), TRUE);
+    idleBrush_ = CreateSolidBrush(kIdleBg);
+    runBrush_  = CreateSolidBrush(kRunBg);
+    okBrush_   = CreateSolidBrush(kOkBg);
+    failBrush_ = CreateSolidBrush(kFailBg);
+    applyBannerState(dialog, Verdict::Pending, false);
 
     setTransportFieldsEnabled(dialog);
     EnableWindow(GetDlgItem(dialog, IDC_STOP_BUTTON), FALSE);
 
     SetTimer(dialog, kStatusTimer, kStatusIntervalMs, nullptr);
+}
 
-    HICON icon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_SIMUL_MAIN));
-    if (icon) {
-        SendMessageW(dialog, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
-        SendMessageW(dialog, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
-    }
+HBRUSH App::onCtlColor(HWND control)
+{
+    if (control == GetDlgItem(dialog_, IDC_RESULT_TEXT) && activeBrush_)
+        return activeBrush_;
+    return nullptr;
+}
+
+void App::applyBannerState(HWND dialog, Verdict verdict, bool running)
+{
+    if (running)                  activeBrush_ = runBrush_;
+    else if (verdict == Verdict::Ok)   activeBrush_ = okBrush_;
+    else if (verdict == Verdict::Fail) activeBrush_ = failBrush_;
+    else                               activeBrush_ = idleBrush_;
+    activeText_ = RGB(255, 255, 255);
+    setText(dialog, IDC_RESULT_TEXT, verdictBanner(verdict, running));
+    InvalidateRect(GetDlgItem(dialog, IDC_RESULT_TEXT), nullptr, TRUE);
 }
 
 void App::onCommand(HWND dialog, int id, int code)
@@ -190,20 +252,21 @@ void App::onCommand(HWND dialog, int id, int code)
         startTest(dialog);
         break;
     case IDC_STOP_BUTTON:
-        stopTest(dialog, L"User pressed Stop.");
+        stopTest(dialog, L"사용자 중지.");
         break;
     case IDC_VSPE_BUTTON: {
         const auto portText = trimmed(getText(dialog, IDC_SERIAL_PORT));
         unsigned long base = 0;
         if (portText.size() < 4 || portText.substr(0, 3) != L"COM" ||
             !parseUnsigned(portText.substr(3), base, 4096) || !base) {
-            MessageBoxW(dialog, L"Enter a valid COM port in the Serial Port field first.",
+            MessageBoxW(dialog, L"유효한 COM 포트 번호 입력 필요.",
                         L"SIMUL", MB_ICONINFORMATION);
             break;
         }
+        const unsigned mate = base + 1 <= 4096 ? static_cast<unsigned>(base + 1)
+                                               : static_cast<unsigned>(base - 1);
         std::vector<VspePair> pairs;
-        pairs.push_back({static_cast<unsigned>(base),
-                         static_cast<unsigned>(base + 1 <= 4096 ? base + 1 : base - 1)});
+        pairs.push_back({static_cast<unsigned>(base), mate});
         const auto result = launchVspe(dialog, pairs);
         MessageBoxW(dialog, result.message.c_str(), L"SIMUL",
                     result.launched ? MB_ICONINFORMATION : MB_ICONWARNING);
@@ -249,20 +312,20 @@ void App::setTransportFieldsEnabled(HWND dialog)
 bool App::readSettings(HWND dialog, TestSettings& settings, std::wstring& error) const
 {
     const int index = ComboBox_GetCurSel(GetDlgItem(dialog, IDC_TRANSPORT_COMBO));
-    if (index == 0) settings.transport.kind = TransportKind::Serial;
+    if      (index == 0) settings.transport.kind = TransportKind::Serial;
     else if (index == 1) settings.transport.kind = TransportKind::Tcp;
     else if (index == 2) settings.transport.kind = TransportKind::Udp;
-    else { error = L"Pick a transport."; return false; }
+    else { error = L"접속 방식 선택 필요."; return false; }
 
     if (settings.transport.kind == TransportKind::Serial) {
         settings.transport.serial.port = trimmed(getText(dialog, IDC_SERIAL_PORT));
         if (settings.transport.serial.port.empty()) {
-            error = L"Enter a serial port name, e.g. COM101.";
+            error = L"직렬 포트명 입력 필요 (예: COM101).";
             return false;
         }
         unsigned long baud = 0;
         if (!parseUnsigned(trimmed(getText(dialog, IDC_SERIAL_BAUD)), baud, 4000000) || !baud) {
-            error = L"Enter a baud rate between 1 and 4000000.";
+            error = L"보/속 1~4000000 범위 입력 필요.";
             return false;
         }
         settings.transport.serial.baud = static_cast<DWORD>(baud);
@@ -271,40 +334,34 @@ bool App::readSettings(HWND dialog, TestSettings& settings, std::wstring& error)
         unsigned long port = 0;
         if (settings.transport.tcp.host.empty() ||
             !parseUnsigned(trimmed(getText(dialog, IDC_TCP_PORT)), port, 65535) || !port) {
-            error = L"Enter a valid TCP host and port.";
+            error = L"TCP 상대 주소·포트 입력 필요.";
             return false;
         }
         settings.transport.tcp.port = static_cast<unsigned short>(port);
     } else {
-        settings.transport.udp.localHost = wideToNarrow(trimmed(getText(dialog, IDC_UDP_LOCAL_HOST)));
+        settings.transport.udp.localHost  = wideToNarrow(trimmed(getText(dialog, IDC_UDP_LOCAL_HOST)));
         settings.transport.udp.remoteHost = wideToNarrow(trimmed(getText(dialog, IDC_UDP_REMOTE_HOST)));
         unsigned long localPort = 0, remotePort = 0;
         if (settings.transport.udp.localHost.empty() ||
             settings.transport.udp.remoteHost.empty() ||
-            !parseUnsigned(trimmed(getText(dialog, IDC_UDP_LOCAL_PORT)), localPort, 65535) || !localPort ||
+            !parseUnsigned(trimmed(getText(dialog, IDC_UDP_LOCAL_PORT)),  localPort,  65535) || !localPort ||
             !parseUnsigned(trimmed(getText(dialog, IDC_UDP_REMOTE_PORT)), remotePort, 65535) || !remotePort) {
-            error = L"Enter valid UDP local and remote host and port.";
+            error = L"UDP 수신·송신 주소·포트 입력 필요.";
             return false;
         }
-        settings.transport.udp.localPort = static_cast<unsigned short>(localPort);
+        settings.transport.udp.localPort  = static_cast<unsigned short>(localPort);
         settings.transport.udp.remotePort = static_cast<unsigned short>(remotePort);
     }
 
     unsigned long hours = 0, minutes = 0;
-    if (!parseUnsigned(trimmed(getText(dialog, IDC_DURATION_HOURS)), hours, 72) ||
+    if (!parseUnsigned(trimmed(getText(dialog, IDC_DURATION_HOURS)),   hours,   72) ||
         !parseUnsigned(trimmed(getText(dialog, IDC_DURATION_MINUTES)), minutes, 59)) {
-        error = L"Duration must be 0..72 hours and 0..59 minutes.";
+        error = L"시험 시간: 0~72 시간, 0~59 분.";
         return false;
     }
     const auto seconds = hours * 3600ULL + minutes * 60ULL;
-    if (!seconds) {
-        error = L"Pick a non-zero duration (minimum one minute).";
-        return false;
-    }
-    if (seconds > 72ULL * 3600ULL) {
-        error = L"Maximum test duration is 72 hours.";
-        return false;
-    }
+    if (!seconds)              { error = L"시험 시간은 최소 1분 이상 지정.";    return false; }
+    if (seconds > 72ULL * 3600) { error = L"시험 시간 최대 72 시간.";             return false; }
     settings.duration = std::chrono::seconds(seconds);
     settings.interval = std::chrono::milliseconds(50);
     return true;
@@ -326,23 +383,23 @@ void App::startTest(HWND dialog)
         return;
     }
     running_ = true;
-    EnableWindow(GetDlgItem(dialog, IDC_START_BUTTON), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_STOP_BUTTON), TRUE);
+    EnableWindow(GetDlgItem(dialog, IDC_START_BUTTON),    FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_STOP_BUTTON),     TRUE);
     EnableWindow(GetDlgItem(dialog, IDC_TRANSPORT_COMBO), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_SERIAL_PORT), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_SERIAL_BAUD), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_TCP_HOST), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_TCP_PORT), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_UDP_LOCAL_HOST), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_UDP_LOCAL_PORT), FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_SERIAL_PORT),     FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_SERIAL_BAUD),     FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_TCP_HOST),        FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_TCP_PORT),        FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_UDP_LOCAL_HOST),  FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_UDP_LOCAL_PORT),  FALSE);
     EnableWindow(GetDlgItem(dialog, IDC_UDP_REMOTE_HOST), FALSE);
     EnableWindow(GetDlgItem(dialog, IDC_UDP_REMOTE_PORT), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_DURATION_HOURS), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_DURATION_MINUTES), FALSE);
-    EnableWindow(GetDlgItem(dialog, IDC_VSPE_BUTTON), FALSE);
-    appendLog(dialog, L"Test started.");
-    setText(dialog, IDC_RESULT_TEXT, L"TEST: running");
-    setText(dialog, IDC_STATUS_TEXT, L"Sending frames every 50 ms.");
+    EnableWindow(GetDlgItem(dialog, IDC_DURATION_HOURS),  FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_DURATION_MINUTES),FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_VSPE_BUTTON),     FALSE);
+    appendLog(dialog, L"시험 시작.");
+    setText(dialog, IDC_STATUS_TEXT, L"송신 주기 50 ms, DATA 32 Byte 반송 검증 중.");
+    applyBannerState(dialog, Verdict::Pending, true);
 }
 
 void App::stopTest(HWND dialog, const std::wstring& reason)
@@ -352,33 +409,33 @@ void App::stopTest(HWND dialog, const std::wstring& reason)
     const auto snap = test_->snapshot();
     test_.reset();
     running_ = false;
-    EnableWindow(GetDlgItem(dialog, IDC_START_BUTTON), TRUE);
-    EnableWindow(GetDlgItem(dialog, IDC_STOP_BUTTON), FALSE);
+    EnableWindow(GetDlgItem(dialog, IDC_START_BUTTON),    TRUE);
+    EnableWindow(GetDlgItem(dialog, IDC_STOP_BUTTON),     FALSE);
     EnableWindow(GetDlgItem(dialog, IDC_TRANSPORT_COMBO), TRUE);
     setTransportFieldsEnabled(dialog);
-    EnableWindow(GetDlgItem(dialog, IDC_DURATION_HOURS), TRUE);
+    EnableWindow(GetDlgItem(dialog, IDC_DURATION_HOURS),   TRUE);
     EnableWindow(GetDlgItem(dialog, IDC_DURATION_MINUTES), TRUE);
 
     const auto verdict = snap.verdict == Verdict::Pending
         ? (snap.failed == 0 ? Verdict::Ok : Verdict::Fail)
         : snap.verdict;
-    setText(dialog, IDC_RESULT_TEXT, L"TEST: " + verdictText(verdict));
+    applyBannerState(dialog, verdict, false);
     setText(dialog, IDC_STATUS_TEXT, reason);
-    appendLog(dialog, L"Test stopped: " + reason);
+    appendLog(dialog, L"시험 종료: " + reason);
 }
 
 void App::updateStatus(HWND dialog)
 {
     if (!test_) return;
     const auto snap = test_->snapshot();
-    setText(dialog, IDC_TX_COUNT,   L"TX: " + std::to_wstring(snap.sent));
-    setText(dialog, IDC_RX_COUNT,   L"RX: " + std::to_wstring(snap.received));
-    setText(dialog, IDC_FAIL_COUNT, L"FAIL: " + std::to_wstring(snap.failed));
+    setText(dialog, IDC_TX_COUNT,   L"송신 " + std::to_wstring(snap.sent));
+    setText(dialog, IDC_RX_COUNT,   L"수신 " + std::to_wstring(snap.received));
+    setText(dialog, IDC_FAIL_COUNT, L"실패 " + std::to_wstring(snap.failed));
     setText(dialog, IDC_ELAPSED_TEXT,
-            formatDuration(snap.elapsed) + L" / " +
+            L"경과 " + formatDuration(snap.elapsed) + L" / " +
             formatDuration(std::chrono::duration_cast<std::chrono::milliseconds>(snap.duration)));
-    setText(dialog, IDC_RESULT_TEXT, L"TEST: " +
-            (snap.running ? std::wstring(L"running") : verdictText(snap.verdict)));
+
+    applyBannerState(dialog, snap.verdict, snap.running);
 
     if (!snap.lastEvent.empty() && snap.lastEvent != lastEvent_) {
         lastEvent_ = snap.lastEvent;
@@ -387,8 +444,8 @@ void App::updateStatus(HWND dialog)
 
     if (!snap.running && running_) {
         stopTest(dialog, snap.verdict == Verdict::Ok
-                 ? L"Duration reached. All frames matched."
-                 : snap.lastEvent.empty() ? L"Test stopped." : snap.lastEvent);
+                 ? std::wstring(L"시험 시간 완료, 전 프레임 일치.")
+                 : (snap.lastEvent.empty() ? std::wstring(L"시험 종료.") : snap.lastEvent));
     }
 }
 
