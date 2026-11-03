@@ -1,0 +1,13 @@
+build/
+out/
+*.user
+*.suo
+*.sdf
+*.opendb
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib

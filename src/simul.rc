@@ -1,0 +1,84 @@
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
+LANGUAGE LANG_KOREAN, SUBLANG_KOREAN
+
+IDD_MAIN DIALOGEX 0, 0, 360, 300
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "SIMUL - Loopback Simulator (by Jeongmin Lee)"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Transport",                           -1,  7,   7, 346,  70
+    LTEXT           "Interface:",                          -1, 15,  20,  40,  10
+    COMBOBOX        IDC_TRANSPORT_COMBO,                       60,  18, 160,  80,
+                    CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL
+
+    LTEXT           "Serial Port:",                        -1, 15,  36,  40,  10
+    EDITTEXT        IDC_SERIAL_PORT,                           60,  34,  60,  12, ES_AUTOHSCROLL
+    LTEXT           "Baud:",                               -1, 128,  36,  22,  10
+    EDITTEXT        IDC_SERIAL_BAUD,                          155,  34,  55,  12, ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "Launch VSPE...",   IDC_VSPE_BUTTON,      220,  33,  80,  14
+
+    LTEXT           "TCP Host:",                           -1, 15,  52,  40,  10
+    EDITTEXT        IDC_TCP_HOST,                              60,  50,  90,  12, ES_AUTOHSCROLL
+    LTEXT           "Port:",                               -1,160,  52,  20,  10
+    EDITTEXT        IDC_TCP_PORT,                             185,  50,  40,  12, ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "UDP Local:",                          -1, 15,  66,  40,  10
+    EDITTEXT        IDC_UDP_LOCAL_HOST,                        60,  64,  70,  12, ES_AUTOHSCROLL
+    EDITTEXT        IDC_UDP_LOCAL_PORT,                       135,  64,  35,  12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "UDP Remote:",                         -1,180,  66,  44,  10
+    EDITTEXT        IDC_UDP_REMOTE_HOST,                      226,  64,  70,  12, ES_AUTOHSCROLL
+    EDITTEXT        IDC_UDP_REMOTE_PORT,                      300,  64,  35,  12, ES_AUTOHSCROLL | ES_NUMBER
+
+    GROUPBOX        "Test",                                -1,  7,  85, 346,  52
+    LTEXT           "Duration:",                           -1, 15,  98,  40,  10
+    EDITTEXT        IDC_DURATION_HOURS,                        60,  96,  28,  12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "hours",                               -1, 93,  98,  22,  10
+    EDITTEXT        IDC_DURATION_MINUTES,                     118,  96,  28,  12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "minutes (max 72 h)",                  -1,152,  98,  80,  10
+
+    DEFPUSHBUTTON   "Start",            IDC_START_BUTTON,     15, 115,  70,  16
+    PUSHBUTTON      "Stop",             IDC_STOP_BUTTON,     100, 115,  70,  16
+    LTEXT           "Sends 32 random bytes every 50 ms, verifies echo.",
+                                                           -1,180, 118, 170,  10
+
+    GROUPBOX        "Status",                              -1,  7, 143, 346,  60
+    LTEXT           "TEST: idle",       IDC_RESULT_TEXT,     15, 155, 160,  12
+    LTEXT           "",                 IDC_STATUS_TEXT,     15, 170, 330,  12
+    LTEXT           "TX: 0",            IDC_TX_COUNT,        15, 186,  80,  10
+    LTEXT           "RX: 0",            IDC_RX_COUNT,       100, 186,  80,  10
+    LTEXT           "FAIL: 0",          IDC_FAIL_COUNT,     185, 186,  80,  10
+    LTEXT           "0:00:00 / 0:00:00",IDC_ELAPSED_TEXT,   270, 186,  80,  10
+
+    GROUPBOX        "Log",                                 -1,  7, 207, 346,  85
+    EDITTEXT        IDC_LOG_TEXT,                              15, 220, 330,  65,
+                    ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Jeongmin Lee"
+            VALUE "FileDescription",  "SIMUL Loopback Simulator"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "SIMUL"
+            VALUE "LegalCopyright",   "Copyright (C) Jeongmin Lee"
+            VALUE "OriginalFilename", "SIMUL.exe"
+            VALUE "ProductName",      "SIMUL"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
