@@ -1,15 +1,16 @@
 #include "protocol.h"
 
 #include <algorithm>
+#include <chrono>
 #include <random>
 
-namespace simul {
+namespace loopback {
 
 std::uint16_t crc16(const Byte* data, std::size_t size)
 {
     std::uint16_t crc = 0xFFFF;
     for (std::size_t i = 0; i < size; ++i) {
-        crc ^= static_cast<std::uint16_t>(data[i]) << 8;
+        crc = static_cast<std::uint16_t>(crc ^ (data[i] << 8));
         for (int bit = 0; bit < 8; ++bit) {
             crc = (crc & 0x8000) ? static_cast<std::uint16_t>((crc << 1) ^ 0x1021)
                                  : static_cast<std::uint16_t>(crc << 1);
@@ -20,8 +21,16 @@ std::uint16_t crc16(const Byte* data, std::size_t size)
 
 void randomData(Data& out)
 {
-    thread_local std::random_device seed;
-    thread_local std::mt19937 engine(seed());
+    // 결정적 random_device 구현 대비 단조 시계값 혼합
+    thread_local std::mt19937 engine = [] {
+        std::random_device device;
+        const auto tick = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        std::seed_seq seed{device(), device(), device(), device(),
+                           static_cast<unsigned>(tick & 0xFFFFFFFFu),
+                           static_cast<unsigned>(tick >> 32)};
+        return std::mt19937(seed);
+    }();
     std::uniform_int_distribution<unsigned> dist(0x00, 0xFF);
     for (auto& byte : out) byte = static_cast<Byte>(dist(engine));
 }
@@ -38,89 +47,101 @@ void appendEscaped(Buffer& out, Byte value)
     }
 }
 
+ParseResult verifyBody(const Buffer& body, Data& dataOut, std::size_t discarded)
+{
+    ParseResult result{Parse::Invalid, FrameError::None, discarded};
+    if (body.size() != PAYLOAD_SIZE) {
+        result.error = FrameError::Length;
+    } else if (body[0] != HEADER_HI || body[1] != HEADER_LO) {
+        result.error = FrameError::Header;
+    } else if (body[TRAILER_OFFSET] != TRAILER_HI || body[TRAILER_OFFSET + 1] != TRAILER_LO) {
+        result.error = FrameError::Trailer;
+    } else if (static_cast<std::uint16_t>((body[CRC_OFFSET] << 8) | body[CRC_OFFSET + 1]) !=
+               crc16(body.data(), CRC_OFFSET)) {
+        result.error = FrameError::Crc;
+    } else {
+        std::copy_n(body.begin() + static_cast<std::ptrdiff_t>(DATA_OFFSET), DATA_SIZE, dataOut.begin());
+        result.status = Parse::Ok;
+    }
+    return result;
+}
+
 }  // namespace
 
 Buffer buildFrame(const Data& data)
 {
-    Buffer payload;
-    payload.reserve(PAYLOAD_SIZE);
-    payload.push_back(HEADER_HI);
-    payload.push_back(HEADER_LO);
-    payload.insert(payload.end(), data.begin(), data.end());
+    Buffer body;
+    body.reserve(PAYLOAD_SIZE);
+    body.push_back(HEADER_HI);
+    body.push_back(HEADER_LO);
+    body.insert(body.end(), data.begin(), data.end());
 
-    // CRC 범위: C0C1 + DATA(32)
-    const std::uint16_t crc = crc16(payload.data(), payload.size());
-    payload.push_back(static_cast<Byte>((crc >> 8) & 0xFF));
-    payload.push_back(static_cast<Byte>(crc & 0xFF));
-
-    payload.push_back(TRAILER_HI);
-    payload.push_back(TRAILER_LO);
+    const std::uint16_t crc = crc16(body.data(), body.size());
+    body.push_back(static_cast<Byte>(crc >> 8));
+    body.push_back(static_cast<Byte>(crc & 0xFF));
+    body.push_back(TRAILER_HI);
+    body.push_back(TRAILER_LO);
 
     Buffer frame;
-    frame.reserve(payload.size() * 2 + 2);
+    frame.reserve(MAX_FRAME_SIZE);
     frame.push_back(STX);
-    for (Byte b : payload) appendEscaped(frame, b);
+    for (Byte b : body) appendEscaped(frame, b);
     frame.push_back(ETX);
     return frame;
 }
 
-Parse parseFrame(Buffer& inOut, Data& dataOut)
+ParseResult parseFrame(Buffer& inOut, Data& dataOut)
 {
-    auto firstStx = std::find(inOut.begin(), inOut.end(), STX);
-    if (firstStx != inOut.begin()) inOut.erase(inOut.begin(), firstStx);
-    if (inOut.empty()) return Parse::NeedMore;
+    const auto start = std::find(inOut.begin(), inOut.end(), STX);
+    const auto discarded = static_cast<std::size_t>(start - inOut.begin());
+    inOut.erase(inOut.begin(), start);
+    if (inOut.empty()) return {Parse::NeedMore, FrameError::None, discarded};
 
-    Buffer payload;
-    payload.reserve(PAYLOAD_SIZE);
+    const auto consume = [&inOut](std::size_t count) {
+        inOut.erase(inOut.begin(), inOut.begin() + static_cast<std::ptrdiff_t>(count));
+    };
+    const auto invalid = [discarded](FrameError error) {
+        return ParseResult{Parse::Invalid, error, discarded};
+    };
+
+    // 본문 오류 확정 후에도 ETX까지 동일 전문으로 소비하여 잔여 바이트의 중복 계수 방지
+    Buffer body;
+    body.reserve(PAYLOAD_SIZE + 1);
     bool escaping = false;
-    std::size_t consumed = 1;
-    bool frameClosed = false;
-    bool valid = true;
-
+    FrameError fault = FrameError::None;
     for (std::size_t i = 1; i < inOut.size(); ++i) {
         const Byte b = inOut[i];
-        ++consumed;
-
-        // 중첩 STX: 재동기화를 위해 선행 전문 폐기, 신규 STX 보존
-        if (b == STX && !escaping) {
-            --consumed;
-            inOut.erase(inOut.begin(), inOut.begin() + static_cast<long>(consumed));
-            return Parse::Invalid;
+        if (b == STX) {
+            consume(i);
+            return invalid(fault != FrameError::None ? fault : FrameError::Resync);
         }
-
-        if (b == ETX && !escaping) { frameClosed = true; break; }
-
+        if (b == ETX) {
+            consume(i + 1);
+            if (fault == FrameError::None && escaping) fault = FrameError::Escape;
+            if (fault != FrameError::None) return invalid(fault);
+            return verifyBody(body, dataOut, discarded);
+        }
+        // 최대 길이 초과 전문은 ETX·STX까지 동일 전문으로 소비. 경계 없는 바이트열은 4배 길이에서 절단
+        if (i + 1 >= MAX_FRAME_SIZE * 4) {
+            consume(i + 1);
+            return invalid(fault != FrameError::None ? fault : FrameError::Length);
+        }
+        if (i + 1 >= MAX_FRAME_SIZE && fault == FrameError::None) fault = FrameError::Length;
+        if (fault != FrameError::None) continue;
         if (escaping) {
             escaping = false;
-            if (b == 0x82) payload.push_back(STX);
-            else if (b == 0x83) payload.push_back(ETX);
-            else if (b == 0x80) payload.push_back(DLE);
-            else { valid = false; break; }
-            continue;
+            if (b == (STX | 0x80)) body.push_back(STX);
+            else if (b == (ETX | 0x80)) body.push_back(ETX);
+            else if (b == DLE) body.push_back(DLE);
+            else fault = FrameError::Escape;
+        } else if (b == DLE) {
+            escaping = true;
+        } else {
+            body.push_back(b);
         }
-        if (b == DLE) { escaping = true; continue; }
-        payload.push_back(b);
-
-        if (payload.size() > PAYLOAD_SIZE) { valid = false; break; }
+        if (body.size() > PAYLOAD_SIZE) fault = FrameError::Length;
     }
-
-    if (!frameClosed && valid) return Parse::NeedMore;
-
-    inOut.erase(inOut.begin(), inOut.begin() + static_cast<long>(consumed));
-
-    if (!frameClosed || !valid) return Parse::Invalid;
-    if (payload.size() != PAYLOAD_SIZE) return Parse::Invalid;
-    if (payload[0] != HEADER_HI || payload[1] != HEADER_LO) return Parse::Invalid;
-    if (payload[PAYLOAD_SIZE - 2] != TRAILER_HI || payload[PAYLOAD_SIZE - 1] != TRAILER_LO)
-        return Parse::Invalid;
-
-    const std::uint16_t expected = static_cast<std::uint16_t>(
-        (payload[2 + DATA_SIZE] << 8) | payload[2 + DATA_SIZE + 1]);
-    const std::uint16_t actual = crc16(payload.data(), 2 + DATA_SIZE);
-    if (expected != actual) return Parse::Invalid;
-
-    std::copy(payload.begin() + 2, payload.begin() + 2 + DATA_SIZE, dataOut.begin());
-    return Parse::Ok;
+    return {Parse::NeedMore, FrameError::None, discarded};
 }
 
-}  // namespace simul
+}  // namespace loopback
