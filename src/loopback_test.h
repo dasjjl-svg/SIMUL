@@ -35,8 +35,7 @@ struct TestSnapshot {
 };
 
 // 반송 시험 러너. 작업 스레드 1개가 송·수신 양방향 처리.
-// 한 건이라도 수신 전문이 송신 적재와 상이하면 verdict=Fail.
-// duration 완료 시 failed==0 이면 verdict=Ok.
+// 판정: 송신 전 프레임이 echoTimeout 이내 동일 DATA로 회신될 때만 Ok.
 class LoopbackTest {
 public:
     LoopbackTest();
@@ -48,8 +47,17 @@ public:
     void stop();
     TestSnapshot snapshot() const;
 
+    // 반송 허용 지연. 초과 프레임은 실패 처리, 시험 종료 시 잔여 회신 대기 상한 겸용
+    static constexpr std::chrono::milliseconds echoTimeout{1000};
+
 private:
+    struct Outstanding {
+        Data data;
+        std::chrono::steady_clock::time_point sentAt;
+    };
+
     void run();
+    void fail(const std::wstring& event);
 
     TestSettings settings_{};
     std::unique_ptr<Transport> transport_;
@@ -59,12 +67,9 @@ private:
 
     mutable std::mutex mutex_;
     TestSnapshot state_{};
-    std::deque<Data> pending_;
+    std::deque<Outstanding> pending_;
     Buffer rxBuffer_;
     std::chrono::steady_clock::time_point startedAt_{};
-
-    // 미회신 적재 상한. 20Hz × 6.4s = 128프레임
-    static constexpr std::size_t pendingLimit = 128;
 };
 
 }  // namespace simul

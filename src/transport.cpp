@@ -174,7 +174,7 @@ public:
     {
         if (!isOpen()) { error = L"TCP 소켓 미연결."; return false; }
         std::size_t offset = 0;
-        // 50ms 주기 44B 전문은 수회 재시도 내 완료
+        // WSAEWOULDBLOCK 재시도 상한 100회. 최대 전문 78B 기준 충분
         for (int retry = 0; offset < frame.size() && retry < 100; ++retry) {
             const int sent = ::send(socket_,
                 reinterpret_cast<const char*>(frame.data() + offset),

@@ -40,7 +40,6 @@ private:
     HBRUSH okBrush_     = nullptr;
     HBRUSH failBrush_   = nullptr;
     HBRUSH activeBrush_ = nullptr;
-    COLORREF activeText_ = RGB(255, 255, 255);
 
     std::unique_ptr<LoopbackTest> test_;
     bool running_ = false;

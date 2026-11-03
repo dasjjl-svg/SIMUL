@@ -25,11 +25,10 @@ constexpr const wchar_t* kTransportNames[] = {
     L"UDP",
 };
 
-// 배너 상태 색상
-constexpr COLORREF kIdleBg   = RGB( 55,  65,  81);   // slate-700
-constexpr COLORREF kRunBg    = RGB(217, 119,   6);   // amber-600
-constexpr COLORREF kOkBg     = RGB( 22, 163,  74);   // green-600
-constexpr COLORREF kFailBg   = RGB(220,  38,  38);   // red-600
+constexpr COLORREF kIdleBg = RGB( 55,  65,  81);
+constexpr COLORREF kRunBg  = RGB(217, 119,   6);
+constexpr COLORREF kOkBg   = RGB( 22, 163,  74);
+constexpr COLORREF kFailBg = RGB(220,  38,  38);
 
 void setText(HWND dialog, int id, const std::wstring& text)
 {
@@ -65,7 +64,6 @@ bool parseUnsigned(const std::wstring& text, unsigned long& out, unsigned long l
     return true;
 }
 
-// IPv4 문자열 변환 (ASCII 범위 보장)
 std::string wideToNarrow(const std::wstring& s)
 {
     if (s.empty()) return {};
@@ -89,16 +87,6 @@ std::wstring formatDuration(std::chrono::milliseconds elapsed)
     std::swprintf(buffer, std::size(buffer), L"%lld:%02lld:%02lld",
                   hours, minutes, seconds);
     return buffer;
-}
-
-std::wstring verdictBanner(Verdict verdict, bool running)
-{
-    if (running) return L"시 험 중";
-    switch (verdict) {
-    case Verdict::Ok:   return L"O  K";
-    case Verdict::Fail: return L"F A I L";
-    default:            return L"대 기 중";
-    }
 }
 
 HFONT makeBannerFont()
@@ -170,8 +158,7 @@ INT_PTR App::handle(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
         HBRUSH brush = onCtlColor(reinterpret_cast<HWND>(lParam));
         if (brush) {
             HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, activeText_);
-            SetBkColor(dc, GetBkColor(dc));
+            SetTextColor(dc, RGB(255, 255, 255));
             SetBkMode(dc, TRANSPARENT);
             return reinterpret_cast<INT_PTR>(brush);
         }
@@ -184,7 +171,6 @@ INT_PTR App::handle(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
         EndDialog(dialog, 0);
         return TRUE;
     }
-    (void)lParam;
     return FALSE;
 }
 
@@ -210,7 +196,6 @@ void App::onInit(HWND dialog)
     setText(dialog, IDC_FAIL_COUNT,   L"실패 0");
     setText(dialog, IDC_ELAPSED_TEXT, L"경과 0:00:00 / 0:00:00");
 
-    // 배너 전용 큰 글꼴·상태 브러시
     bannerFont_ = makeBannerFont();
     if (bannerFont_)
         SendMessageW(GetDlgItem(dialog, IDC_RESULT_TEXT), WM_SETFONT,
@@ -236,12 +221,16 @@ HBRUSH App::onCtlColor(HWND control)
 
 void App::applyBannerState(HWND dialog, Verdict verdict, bool running)
 {
-    if (running)                  activeBrush_ = runBrush_;
-    else if (verdict == Verdict::Ok)   activeBrush_ = okBrush_;
-    else if (verdict == Verdict::Fail) activeBrush_ = failBrush_;
-    else                               activeBrush_ = idleBrush_;
-    activeText_ = RGB(255, 255, 255);
-    setText(dialog, IDC_RESULT_TEXT, verdictBanner(verdict, running));
+    // 실패는 시험 진행 중에도 즉시 표시
+    HBRUSH brush;
+    const wchar_t* text;
+    if (verdict == Verdict::Fail)    { brush = failBrush_; text = L"F A I L"; }
+    else if (running)                { brush = runBrush_;  text = L"시 험 중"; }
+    else if (verdict == Verdict::Ok) { brush = okBrush_;   text = L"O K"; }
+    else                             { brush = idleBrush_; text = L"대 기"; }
+    if (brush == activeBrush_) return;
+    activeBrush_ = brush;
+    setText(dialog, IDC_RESULT_TEXT, text);
     InvalidateRect(GetDlgItem(dialog, IDC_RESULT_TEXT), nullptr, TRUE);
 }
 
@@ -325,7 +314,7 @@ bool App::readSettings(HWND dialog, TestSettings& settings, std::wstring& error)
         }
         unsigned long baud = 0;
         if (!parseUnsigned(trimmed(getText(dialog, IDC_SERIAL_BAUD)), baud, 4000000) || !baud) {
-            error = L"보/속 1~4000000 범위 입력 필요.";
+            error = L"통신 속도 1~4000000 bps 범위 입력 필요.";
             return false;
         }
         settings.transport.serial.baud = static_cast<DWORD>(baud);

@@ -21,7 +21,6 @@ constexpr Byte HEADER_LO  = 0xC1;
 constexpr Byte TRAILER_HI = 0xFF;
 constexpr Byte TRAILER_LO = 0xFF;
 
-// DATA 고정 길이
 constexpr std::size_t DATA_SIZE = 32;
 
 // STX·ETX 사이 논리 적재: C0 C1 | DATA(32) | CRC16(2) | FF FF
