@@ -98,6 +98,8 @@ private:
     };
 
     void run();
+    // 치명 송신 오류 시 이미 도착한 수신분 판정 반영
+    void collectReceived();
     void finish(const std::wstring& abortReason);
 
     // 이하 mutex_ 보유 상태 호출 전제
@@ -151,7 +153,8 @@ private:
     bool dropLocalEcho_ = false;       // 송신 전문당 최초 사본 판정 제외
     bool echoDetected_ = false;        // 반향 미발생 설정 중 자기 송신 반향 검출
     bool drainStarted_ = false;        // 시험 시간 경과, 잔여 회신 대기 진입
-    Clock::duration settleWait_{};     // 잔여 회신 대기 종료 전 정적 확인 구간
+    Clock::duration settleWait_{};     // 정적 확인 구간: 잔여 회신 대기 종료·잡음 1회 확정 기준
+    Clock::duration drainGrace_{};     // 잔여 회신 대기 기한 경과 시 수신 진행 중 전문의 완결 대기 상한
     std::uint64_t noiseBytes_ = 0;     // 계수 전 연속 전문 외 수신 바이트
     Clock::time_point noiseAt_{};      // 해당 잡음 최초 수신 시각
     double charMicros_ = 0.0;          // 직렬 문자 1개 선로 시간(us)

@@ -24,7 +24,8 @@ namespace {
 constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스레드 정지 시간 제한
 constexpr DWORD kSendTimeoutMs    = 250;   // 전문 1건 송신 처리 상한. 송신 주기 50ms의 5배
 constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
-constexpr DWORD kIoGuardMs = 2;          // 대기 상한(COMMTIMEOUTS) 미준수 드라이버 대비 자체 대기 여유
+constexpr DWORD kIoGuardMs = 20;         // 대기 상한(COMMTIMEOUTS) 미준수 드라이버 대비 자체 대기 여유. 준수 드라이버 자체 만료 우선
+constexpr Byte kUnfilled = 0x5A;         // 수신 버퍼 미기록 판별 표지
 constexpr std::size_t kEchoProbeBytes = 8;  // 송신 반향 확정 최소 일치 바이트. STX·시퀀스 외 DATA 5바이트 이상
 constexpr int   kSocketBufferBytes = 262144;  // 소켓 수신 버퍼. 작업 스레드 지연 구간 데이터그램 보존
 constexpr std::size_t kReceiveBurstBytes = 65536;     // receive 1회 수용 상한. 연속 유입 시 송신 주기 처리 기회 보장
@@ -303,6 +304,13 @@ public:
         return taken;
     }
 
+    std::chrono::steady_clock::time_point issuedAt(std::chrono::steady_clock::time_point) const override
+    {
+        return writeIssued_;
+    }
+
+    bool flush(std::wstring& error) override { return finishWrite(error); }
+
     bool takeSendEcho() override
     {
         const bool echoed = sendEcho_;
@@ -313,13 +321,15 @@ public:
     std::wstring notice() const override { return notice_; }
 
 private:
-    // 비동기 수신 개시 후 완료 대기. 대기 상한 경과 시 자체 취소(취소 전 수신분 유지)
+    // 비동기 수신 개시 후 완료 대기. 대기 상한 + 여유 경과 시 자체 취소(취소 전 기록분 유지)
     bool read(DWORD count, DWORD waitMs, DWORD& got, std::wstring& error)
     {
         got = 0;
         ResetEvent(readEvent_);
         readIo_ = OVERLAPPED{};
         readIo_.hEvent = readEvent_;
+        // 자체 취소 시 버퍼 기록 여부 판별용 표지. 버퍼형 입출력 드라이버는 취소 완료분 미복사
+        std::fill_n(rxChunk_.begin(), count, kUnfilled);
         if (!ReadFile(handle_, rxChunk_.data(), count, nullptr, &readIo_)) {
             const long code = systemError();
             if (code != ERROR_IO_PENDING) {
@@ -330,9 +340,16 @@ private:
         }
         if (!GetOverlappedResult(handle_, &readIo_, &got, TRUE)) {
             const long code = systemError();
-            if (code == ERROR_OPERATION_ABORTED) return true;
-            error = failure(L"직렬 수신 실패", code);
-            return false;
+            if (code != ERROR_OPERATION_ABORTED) {
+                error = failure(L"직렬 수신 실패", code);
+                return false;
+            }
+            // 취소 완료: 보고 수신분이 버퍼에 미기록(표지 그대로)이면 폐기, 회선 이상 계수
+            got = (std::min)(got, count);
+            if (got && std::all_of(rxChunk_.begin(), rxChunk_.begin() + got, [](Byte b) { return b == kUnfilled; })) {
+                addFault(L"수신 취소로 " + std::to_wstring(got) + L" Byte 미전달 (드라이버 대기 상한 미준수)");
+                got = 0;
+            }
         }
         return true;
     }

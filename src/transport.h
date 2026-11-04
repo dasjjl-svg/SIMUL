@@ -71,6 +71,17 @@ public:
     virtual LineFault takeFault() { return {}; }
     // 송신 진행 중 수신 바이트의 송신 전문 선두 일치 여부(직전 receive까지). 반이중 선로의 자기 송신 반향 증거
     virtual bool takeSendEcho() { return false; }
+    // 직전 send의 OS 송신 호출 직전 시각(선로 송신 개시 하한). 미보유 전송로는 fallback(send 호출 직전 시각)
+    virtual std::chrono::steady_clock::time_point issuedAt(std::chrono::steady_clock::time_point fallback) const
+    {
+        return fallback;
+    }
+    // 진행 중 송신 완료 대기·결과 확인. false: 송신 실패
+    virtual bool flush(std::wstring& error)
+    {
+        (void)error;
+        return true;
+    }
     // 개방 시 적용 조건 변경 등 기록 대상 안내
     virtual std::wstring notice() const { return {}; }
 };

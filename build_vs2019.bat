@@ -2,9 +2,15 @@
 setlocal EnableExtensions DisableDelayedExpansion
 for /f "tokens=2 delims=:" %%c in ('"%SystemRoot%\System32\chcp.com"') do set "LT_PREV_CP=%%c"
 "%SystemRoot%\System32\chcp.com" 65001 >nul
-rem 탐색기 실행(더블 클릭) 시 종료 전 대기
+rem 탐색기 실행(더블 클릭)만 종료 전 대기. 탐색기 호출 형태: ComSpec /c ""스크립트 경로" "
 set "LT_PAUSE="
-echo %cmdcmdline% | "%SystemRoot%\System32\find.exe" /i "%~0" >nul && set "LT_PAUSE=1"
+set "LT_CMD=%cmdcmdline:"=%"
+set "LT_EXPLORER=%ComSpec% /c %~f0 "
+rem 비교는 지연 확장 사용. 경로 내 특수 문자(&, 괄호, 공백)의 구문 해석 배제
+setlocal EnableDelayedExpansion
+set "LT_MATCH="
+if /i "!LT_CMD!"=="!LT_EXPLORER!" set "LT_MATCH=1"
+endlocal & set "LT_PAUSE=%LT_MATCH%"
 
 rem Loopback Tester Visual Studio 2019 빌드
 rem 사용: build_vs2019.bat [release 또는 debug] [x64 또는 x86] [clean] [sln] [nopause]
@@ -29,7 +35,7 @@ if /i "%~1"=="sln" set "MODE=sln" & shift & goto parse
 if /i "%~1"=="nopause" set "LT_PAUSE=" & shift & goto parse
 if /i "%~1"=="help" goto help
 if "%~1"=="/?" goto help
-echo [오류] 알 수 없는 인수: %~1
+echo [오류] 알 수 없는 인수: "%~1"
 call :usage
 goto finish
 
@@ -44,18 +50,19 @@ set "PF86=%ProgramFiles(x86)%"
 if "%PF86%"=="" set "PF86=%ProgramFiles%"
 set "VSWHERE=%PF86%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSDIR="
-if exist "%VSWHERE%" for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -version [16.0^,17.0^) -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+if exist "%VSWHERE%" call :findvs
 if not defined VSDIR for %%e in (Enterprise Professional Community BuildTools) do if not defined VSDIR if exist "%PF86%\Microsoft Visual Studio\2019\%%e\VC\Auxiliary\Build\vcvarsall.bat" set "VSDIR=%PF86%\Microsoft Visual Studio\2019\%%e"
 if not defined VSDIR goto novs
 set "VCVARS=%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat"
 if not exist "%VCVARS%" goto novs
-echo Visual Studio 2019: %VSDIR%
+echo Visual Studio 2019: "%VSDIR%"
 if /i "%MODE%"=="sln" goto sln
 
 rem 빌드 환경: 대상 플랫폼별 MSVC v142·Windows SDK. 도구 출력은 영문 고정(UTF-8 콘솔의 한글 메시지 깨짐 방지)
 set "VSLANG=1033"
 call "%VCVARS%" %PLATFORM% >nul
-"%SystemRoot%\System32\where.exe" cl.exe >nul 2>nul || goto novcvars
+"%SystemRoot%\System32\where.exe" cl.exe >nul 2>nul
+if errorlevel 1 goto novcvars
 
 set "OUT=%ROOT%build\vs2019\%PLATFORM%-%CONFIG%"
 set "OBJ=%OUT%\obj"
@@ -69,38 +76,46 @@ set "DEFINES=/DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINN
 set "LINKFLAGS=/nologo /SUBSYSTEM:WINDOWS /MANIFEST:NO"
 if /i "%CONFIG%"=="Release" set "CXXFLAGS=%CXXFLAGS% /O2 /MT /DNDEBUG" & set "LINKFLAGS=%LINKFLAGS% /OPT:REF /OPT:ICF"
 if /i "%CONFIG%"=="Debug" set "CXXFLAGS=%CXXFLAGS% /Od /MTd /Zi /RTC1 /D_DEBUG" & set "LINKFLAGS=%LINKFLAGS% /DEBUG"
-set "SOURCES="%SRC%\main.cpp" "%SRC%\app.cpp" "%SRC%\ui_draw.cpp" "%SRC%\protocol.cpp" "%SRC%\transport.cpp" "%SRC%\loopback_test.cpp" "%SRC%\scheduling.cpp""
-set "OBJECTS="%OBJ%\main.obj" "%OBJ%\app.obj" "%OBJ%\ui_draw.obj" "%OBJ%\protocol.obj" "%OBJ%\transport.obj" "%OBJ%\loopback_test.obj" "%OBJ%\scheduling.obj""
+rem 원본·목적 파일은 해당 폴더 기준 상대 이름 사용. 경로 내 특수 문자(&, ^) 해석 배제
+set "SOURCES=main.cpp app.cpp ui_draw.cpp protocol.cpp transport.cpp loopback_test.cpp scheduling.cpp"
+set "OBJECTS=main.obj app.obj ui_draw.obj protocol.obj transport.obj loopback_test.obj scheduling.obj loopback_tester.res"
 set "LIBS=kernel32.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ws2_32.lib winmm.lib uxtheme.lib setupapi.lib cfgmgr32.lib"
 
 echo.
 echo [1/3] 컴파일: %CONFIG% %PLATFORM%
-cl %CXXFLAGS% %DEFINES% /I"%SRC%" /Fo"%OBJ%\\" /Fd"%OBJ%\\" %SOURCES%
-if errorlevel 1 goto fail
+pushd "%SRC%"
+cl %CXXFLAGS% %DEFINES% /I. /Fo"%OBJ%\\" /Fd"%OBJ%\\" %SOURCES%
+set "STEP=%ERRORLEVEL%"
+popd
+if not "%STEP%"=="0" goto fail
 echo [2/3] 리소스 컴파일
 rc /nologo /i "%SRC%" /fo "%OBJ%\loopback_tester.res" "%SRC%\loopback_tester.rc"
 if errorlevel 1 goto fail
 echo [3/3] 링크
-link %LINKFLAGS% /OUT:"%OUT%\LoopbackTester.exe" %OBJECTS% "%OBJ%\loopback_tester.res" %LIBS%
-if errorlevel 1 goto fail
+pushd "%OBJ%"
+link %LINKFLAGS% /OUT:"%OUT%\LoopbackTester.exe" %OBJECTS% %LIBS%
+set "STEP=%ERRORLEVEL%"
+popd
+if not "%STEP%"=="0" goto fail
 echo.
-echo 빌드 완료: %OUT%\LoopbackTester.exe
+echo 빌드 완료: "%OUT%\LoopbackTester.exe"
 set "RESULT=0"
 goto finish
 
 :sln
-rem 솔루션 생성: Visual Studio 2019 내장 CMake 우선, PATH의 cmake 차선
-set "CMAKE=%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-if not exist "%CMAKE%" set "CMAKE=cmake"
-"%CMAKE%" --version >nul 2>nul || goto nocmake
+rem 솔루션 생성: CMake 3.15 이상. Visual Studio 2019 내장 CMake 우선, PATH의 cmake 차선
+set "CMAKE="
+call :pickcmake "%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if not defined CMAKE call :pickcmake cmake
+if not defined CMAKE goto nocmake
 set "CMAKE_ARCH=x64"
 if /i "%PLATFORM%"=="x86" set "CMAKE_ARCH=Win32"
 set "SLN=%ROOT%build\vs2019\solution-%PLATFORM%"
 if defined CLEAN if exist "%SLN%" rmdir /s /q "%SLN%"
 "%CMAKE%" -G "Visual Studio 16 2019" -A %CMAKE_ARCH% -S "%ROOT%." -B "%SLN%"
-if errorlevel 1 goto fail
+if errorlevel 1 goto slnfail
 echo.
-echo 솔루션 생성 완료: %SLN%\loopback_tester.sln
+echo 솔루션 생성 완료: "%SLN%\loopback_tester.sln"
 set "RESULT=0"
 goto finish
 
@@ -114,7 +129,12 @@ echo [오류] 빌드 환경 설정 실패: "%VCVARS%" %PLATFORM%
 goto finish
 
 :nocmake
-echo [오류] CMake 미검출. Visual Studio Installer에서 "Windows용 C++ CMake 도구" 구성 요소 설치 필요.
+echo [오류] CMake 3.15 이상 미검출. Visual Studio 2019 16.4 이상 업데이트("Windows용 C++ CMake 도구" 포함) 또는 CMake 설치 필요.
+goto finish
+
+:slnfail
+echo.
+echo [오류] 솔루션 생성 실패.
 goto finish
 
 :fail
@@ -127,10 +147,37 @@ echo 사용: build_vs2019.bat [release^|debug] [x64^|x86] [clean] [sln] [nopause
 echo   release, debug  빌드 구성. 기본 release
 echo   x64, x86        대상 플랫폼. 기본 x64
 echo   clean           해당 출력 폴더 삭제 후 빌드
-echo   sln             Visual Studio 2019 솔루션 생성(CMake). 빌드 생략
-echo   nopause         종료 전 대기 생략
+echo   sln             Visual Studio 2019 솔루션 생성(CMake 3.15 이상). 빌드 생략
+echo   nopause         종료 전 대기 생략(탐색기 실행 시에만 대기)
 echo 출력: build\vs2019\플랫폼-구성\LoopbackTester.exe
 exit /b 0
+
+rem vswhere 실행: 설치 폴더 이동 후 상대 실행. 경로 괄호(Program Files (x86))의 명령 해석기 따옴표 처리 회피
+:findvs
+pushd "%PF86%\Microsoft Visual Studio\Installer"
+for /f "usebackq tokens=*" %%i in (`vswhere.exe -version [16.0^,17.0^) -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+popd
+exit /b 0
+
+rem 지정 CMake(전체 경로 또는 cmake)의 버전 3.15 이상 여부. 충족 시 CMAKE 지정
+:pickcmake
+set "LT_VER="
+set "LT_MAJ=0"
+set "LT_MIN=0"
+if /i "%~1"=="cmake" goto pickpath
+if not exist "%~1" exit /b 1
+pushd "%~dp1"
+for /f "tokens=3" %%v in ('cmake.exe --version 2^>nul') do if not defined LT_VER set "LT_VER=%%v"
+popd
+goto pickcheck
+:pickpath
+for /f "tokens=3" %%v in ('cmake --version 2^>nul') do if not defined LT_VER set "LT_VER=%%v"
+:pickcheck
+if not defined LT_VER exit /b 1
+for /f "tokens=1,2 delims=.-" %%a in ("%LT_VER%") do set /a "LT_MAJ=%%a, LT_MIN=%%b" >nul 2>nul
+if %LT_MAJ% GTR 3 set "CMAKE=%~1" & exit /b 0
+if %LT_MAJ% EQU 3 if %LT_MIN% GEQ 15 set "CMAKE=%~1" & exit /b 0
+exit /b 1
 
 :finish
 if defined LT_PAUSE pause

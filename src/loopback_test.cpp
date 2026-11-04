@@ -58,10 +58,15 @@ bool LoopbackTest::open(const TestSettings& settings, std::wstring& error)
     const double stop = serial.stopBits == ONESTOPBIT ? 1.0 : serial.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
     const double bits = 1.0 + serial.dataBits + (serial.parity != NOPARITY ? 1.0 : 0.0) + stop;
     charMicros_ = serial.baud ? bits * 1e6 / static_cast<double>(serial.baud) : 0.0;
-    // 최종 회신 직후 후속 수신(중복·잡음) 확인 구간: 직렬 문자 24개(수신 FIFO 2회 전달분)와 5ms 중 큰 값
+    // 정적 확인 구간: 직렬 문자 24개(수신 FIFO 2회 전달분)와 20ms(USB 변환기 전달 지연 포함) 중 큰 값
+    const bool serialKind = settings.transport.kind == TransportKind::Serial;
     const auto chars = std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(
-        settings.transport.kind == TransportKind::Serial ? charMicros_ * 24.0 : 0.0));
-    settleWait_ = (std::max)(Clock::duration(std::chrono::milliseconds(5)), Clock::duration(chars));
+        serialKind ? charMicros_ * 24.0 : 0.0));
+    settleWait_ = (std::max)(Clock::duration(std::chrono::milliseconds(20)), Clock::duration(chars));
+    // 기한 경과 시점 수신 진행 중 전문의 완결 대기: 최대 전문 선로 시간 + 정적 확인 구간
+    drainGrace_ = Clock::duration(std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(
+                      serialKind ? charMicros_ * static_cast<double>(MAX_FRAME_SIZE) : 0.0))) +
+                  settleWait_;
     transport_ = makeTransport(settings.transport);
     if (!transport_) { error = L"접속 방식 미지원."; return false; }
     if (!transport_->open(error)) { transport_.reset(); return false; }
@@ -159,15 +164,20 @@ void LoopbackTest::run()
     Clock::time_point lastSentAt = startedAt_;
     Frame frame;
     std::wstring abortReason;
-    bool quiet = false;  // 직전 receive 신규 수신 없음
-    Clock::time_point lastRxAt = startedAt_;  // 최근 수신 시각(잔여 회신 대기 종료 전 정적 구간 판정)
+    Clock::time_point lastRxAt = startedAt_;  // 최근 수신 시각(정적 구간 판정 기준)
 
     while (!cancel_.load()) {
         const auto now = Clock::now();
         // 시험 시간 내 예정 주기 송신 완료 후에만 잔여 회신 대기 진입. 종료 직전 정지 시 누락 주기 계수 보장
         if (!draining && now >= deadline && nextTx >= deadline) {
+            // 최종 전문 송신 결과 확인. 실패 시 송신 오류로 시험 중단
+            std::wstring error;
+            if (!transport_->flush(error)) {
+                abortReason = L"송신 오류: " + error;
+                collectReceived();
+                break;
+            }
             draining = true;
-            quiet = false;
             // 잔여 회신 대기: 최종 전문 회신 기한(송신 주기 기준 후속 가상 시퀀스 replyWindow건)까지
             drainUntil = lastSentAt + settings_.interval * settings_.replyWindow;
             std::lock_guard<std::mutex> lock(mutex_);
@@ -175,8 +185,12 @@ void LoopbackTest::run()
         }
         if (draining) {
             std::lock_guard<std::mutex> lock(mutex_);
-            // 잔여 회신 대기 종료: 대기 시간 경과, 또는 미회신·미완결 수신 없이 정적 구간 경과
-            if (now >= drainUntil || (!outstanding_ && rxBuffer_.empty() && now - lastRxAt >= settleWait_)) {
+            const bool settled = now - lastRxAt >= settleWait_;
+            // 잔여 회신 대기 종료: 미회신·미완결 수신 없이 정적 구간 경과, 또는 기한 경과
+            // 기한 경과 시점 수신 진행 중 전문은 정적 구간 또는 완결 대기 상한까지 연장
+            const bool idle = !outstanding_ && rxBuffer_.empty() && settled;
+            const bool expired = now >= drainUntil && (rxBuffer_.empty() || settled || now >= drainUntil + drainGrace_);
+            if (idle || expired) {
                 completed_ = true;
                 break;
             }
@@ -188,12 +202,14 @@ void LoopbackTest::run()
             randomData(frame.data);
             buildFrame(frame, txFrame_);
             std::wstring error;
+            const auto before = Clock::now();
             if (!transport_->send(txFrame_, error)) {
                 abortReason = L"송신 오류: " + error;
+                collectReceived();
                 break;
             }
-            // 송신 시각: 송신 호출 반환 시점(직전 송신 완료 대기 포함)
-            const auto issued = Clock::now();
+            // 송신 시각: OS 송신 호출 직전(직전 송신 완료 대기 이후). 선로 송신 개시 하한, 회신 지연·하한·주기 이탈 기준
+            const auto issued = transport_->issuedAt(before);
             lastSentAt = issued;
             std::lock_guard<std::mutex> lock(mutex_);
             // 잡음 계수 단위 상한: 송신 주기 1회. 진행 중 단발 잡음 분할 방지 위해 1주기 이상 지속분만 확정
@@ -219,13 +235,21 @@ void LoopbackTest::run()
 
         // 다음 처리 시각(송신 주기·가상 시퀀스 기한·잔여 회신 대기 종료·정적 확인)까지 수신 대기. 주기 폴링 배제
         auto wake = Clock::now() + idleWait;
-        if (!draining) {
-            wake = (std::min)(wake, nextTx);
-        } else {
-            const auto elapsedSlots = (Clock::now() - lastSentAt) / settings_.interval;
-            wake = (std::min)({wake, drainUntil, lastSentAt + settings_.interval * (elapsedSlots + 1)});
+        {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!outstanding_) wake = (std::min)(wake, (std::max)(Clock::now(), lastRxAt + settleWait_));
+            const auto current = Clock::now();
+            if (!draining) {
+                wake = (std::min)(wake, nextTx);
+            } else if (current < drainUntil) {
+                const auto elapsedSlots = (current - lastSentAt) / settings_.interval;
+                wake = (std::min)({wake, drainUntil, lastSentAt + settings_.interval * (elapsedSlots + 1)});
+            } else {
+                wake = (std::min)(wake, drainUntil + drainGrace_);
+            }
+            // 정적 구간 도래 시각: 잡음 1회 확정, 잔여 회신 대기 종료 판정
+            const auto quietAt = lastRxAt + settleWait_;
+            if (quietAt > current && (noiseBytes_ || (draining && (!outstanding_ || current >= drainUntil))))
+                wake = (std::min)(wake, quietAt);
         }
         const auto wait = (std::max)(std::chrono::milliseconds(0),
                                      std::chrono::ceil<std::chrono::milliseconds>(wake - Clock::now()));
@@ -235,8 +259,7 @@ void LoopbackTest::run()
         const LineFault fault = transport_->takeFault();
         const bool sendEcho = transport_->takeSendEcho();
         const auto at = Clock::now();
-        quiet = rxBuffer_.size() == buffered;
-        if (!quiet) lastRxAt = at;
+        if (rxBuffer_.size() != buffered) lastRxAt = at;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             // 반향 미발생 설정 중 송신 진행 구간에 송신 전문 동일 바이트 수신: 자기 송신 반향 확정. 해당 전문 사본부터 반향 제거 적용
@@ -261,8 +284,8 @@ void LoopbackTest::run()
                 handleFrame(parsed, got, at);
                 if (parsed.status == Parse::NeedMore) break;
             }
-            // 무수신 구간 도래 시 잡음 1회 발생 확정
-            if (quiet) flushNoise();
+            // 정적 구간 경과 시 잡음 1회 발생 확정. 수신 분할 단위와 무관
+            if (noiseBytes_ && at - lastRxAt >= settleWait_) flushNoise();
             summarize(at);
         }
         if (!received) {
@@ -274,14 +297,33 @@ void LoopbackTest::run()
     finish(abortReason);
 }
 
+void LoopbackTest::collectReceived()
+{
+    std::wstring ignored;
+    transport_->receive(rxBuffer_, std::chrono::milliseconds(0), ignored);
+    const LineFault fault = transport_->takeFault();
+    const auto at = Clock::now();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (fault.count)
+        fail(0, fault.text + (fault.count > 1 ? L" 외 " + grouped(fault.count - 1) + L"건" : std::wstring()), at, true,
+             fault.count);
+    for (;;) {
+        Frame got;
+        const ParseResult parsed = parseFrame(rxBuffer_, got);
+        handleFrame(parsed, got, at);
+        if (parsed.status == Parse::NeedMore) break;
+    }
+}
+
 void LoopbackTest::finish(const std::wstring& abortReason)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto end = Clock::now();
     flushNoise();
     const bool aborted = !abortReason.empty();
-    const bool waitStopped = !aborted && !completed_ && drainStarted_;
-    const bool cancelled = !aborted && !completed_ && !drainStarted_;
+    // 시험 시간 경과 후 중지는 잔여 회신 대기 중 중지(화면 표시 경과 시간 기준과 일치)
+    const bool waitStopped = !aborted && !completed_ && (drainStarted_ || end >= startedAt_ + settings_.duration);
+    const bool cancelled = !aborted && !completed_ && !waitStopped;
     // 잔여 회신 대기 종료: 전 전문 회신 기한 도래
     if (completed_) expireThrough(state_.sent + settings_.replyWindow, end);
     const std::uint64_t unresolved = outstanding_;
@@ -300,10 +342,11 @@ void LoopbackTest::finish(const std::wstring& abortReason)
     }
     // 사용자 중지 시 미회신분은 회신 확인 미완료(판정 보류 사유). 시험 완료·중단 시 미회신분은 이상
     if (!cancelled && !waitStopped && unresolved) {
-        const std::uint64_t first = state_.sent > SEQUENCE_SPACE ? state_.sent - SEQUENCE_SPACE + 1 : 1;
-        for (std::uint64_t n = first; n <= state_.sent; ++n) {
+        // 기한 판정 이전 전문만 대상. 미회신 처리 완료분 중복 계수 배제
+        for (std::uint64_t n = expireCursor_; n <= state_.sent; ++n) {
             const Slot& slot = slotOf(n);
-            if (slot.number == n && !slot.answered) fail(n, L"미회신 (시험 종료 시점)" + echoHint(slot), end, false);
+            if (slot.number == n && !slot.answered && !slot.lost)
+                fail(n, L"미회신 (시험 종료 시점)" + echoHint(slot), end, false);
         }
         if (!aborted) note(L"시험 종료 시점 미회신 " + grouped(unresolved) + L"건.");
     }
@@ -387,7 +430,8 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Frame& got, Cloc
         ++state_.late;
         slot.answered = true;
         lateDetail(L"#" + std::to_wstring(slot.number) + L" 지연 회신 (" + grouped(millisecondsOf(latency)) +
-                       L" ms, 시퀀스 " + grouped(settings_.replyWindow) + L"회 경과 후 도착)", at);
+                       L" ms, 시퀀스 " + grouped(settings_.replyWindow) + L"회 경과 후 도착" +
+                       (slot.localEchoSeen ? L", 송신 반향 수신 확인" : L"") + L")", at);
         return;
     }
     // 반이중 선로의 장치 회신은 송신 완료 후 개시. 하한 미달 사본은 장치 회신 불가, 자기 송신 반향 확정
@@ -430,8 +474,8 @@ void LoopbackTest::expireThrough(std::uint64_t latest, Clock::time_point now)
 std::wstring LoopbackTest::echoHint(const Slot& slot) const
 {
     if (!slot.localEchoSeen) return {};
-    return echoDetected_ ? L". 송신 반향만 수신, 장치 무회신"
-                         : L". 사본 1건만 수신: 장치 무회신 또는 송신 반향 미발생 어댑터 (송신 반향 설정 확인)";
+    return echoDetected_ ? L". 기한 내 송신 반향만 수신 (장치 무회신 또는 회신 지연)"
+                         : L". 기한 내 사본 1건만 수신: 장치 무회신·회신 지연 또는 송신 반향 미발생 어댑터 (송신 반향 설정 확인)";
 }
 
 void LoopbackTest::fail(std::uint64_t number, const std::wstring& text, Clock::time_point at, bool log,
