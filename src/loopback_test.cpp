@@ -177,12 +177,11 @@ void LoopbackTest::run()
             std::lock_guard<std::mutex> lock(mutex_);
             ++state_.sent;
             pending_.push_back(item);
-            // 반향 미발생 설정 중 송신 진행 구간 수신: 자기 송신 반향 확정. 송신 전문 사본부터 반향 제거 적용
-            // 선행 미회신 전문 존재 시 해당 회신 도착 가능성으로 증거 제외
-            if (sendEcho && halfDuplex_ && !dropLocalEcho_ && pending_.size() == 1) {
+            // 반향 미발생 설정 중 송신 진행 구간에 송신 전문 동일 바이트 수신: 자기 송신 반향 확정. 송신 전문 사본부터 반향 제거 적용
+            if (sendEcho && halfDuplex_ && !dropLocalEcho_) {
                 dropLocalEcho_ = true;
                 echoDetected_ = true;
-                const std::wstring text = L"송신 중 수신 검출. 송신 반향 설정 '발생' 필요 (반이중 선로 송신 반향, 이후 반향 제거 적용)";
+                const std::wstring text = L"송신 반향 검출. 송신 반향 설정 '발생' 필요 (송신 중 송신 전문 동일 바이트 수신, 이후 반향 제거 적용)";
                 fail(item.seq, text, now, false);
                 note(L"#" + std::to_wstring(item.seq) + L" " + text);
             }

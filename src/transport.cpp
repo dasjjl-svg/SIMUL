@@ -24,6 +24,7 @@ namespace {
 constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스레드 정지 시간 제한
 constexpr DWORD kSendTimeoutMs    = 250;   // 전문 1건 송신 처리 상한. 송신 주기 50ms의 5배
 constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
+constexpr std::size_t kEchoProbeBytes = 8;  // 송신 반향 대조 최소 바이트. STX·C0·C1 공통 선두 외 DATA 5바이트 이상 포함
 constexpr int   kSocketBufferBytes = 262144;  // 소켓 수신 버퍼. 작업 스레드 지연 구간 데이터그램 보존
 constexpr std::size_t kReceiveBurstBytes = 65536;     // receive 1회 수용 상한. 연속 유입 시 송신 주기 처리 기회 보장
 constexpr std::size_t kReceiveBurstDatagrams = 1024;  // UDP receive 1회 수용 데이터그램 상한
@@ -136,6 +137,7 @@ public:
         const double stop = config.stopBits == ONESTOPBIT ? 1.0 : config.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
         const double bits = 1.0 + config.dataBits + (config.parity != NOPARITY ? 1.0 : 0.0) + stop;
         charMicros_ = config.baud ? bits * 1e6 / static_cast<double>(config.baud) : 0.0;
+        carry_.reserve(4096);
     }
     ~SerialTransport() override { close(); }
 
@@ -221,7 +223,7 @@ public:
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        // RS-485 2선식: 송신 전후 수신 대기열 비교로 자기 송신 반향 증거 수집
+        // RS-485 2선식: 송신 중 수신 바이트와 송신 전문 선두 대조로 자기 송신 반향 증거 수집
         const bool halfDuplex = config_.standard == SerialStandard::Rs485TwoWire;
         DWORD before = 0;
         if (halfDuplex && !queuedBytes(before, error)) return false;
@@ -245,14 +247,27 @@ public:
             // 표본 유효 조건: 송신 완료 대기형 쓰기(소요 ≥ 선로 시간 절반) + 전문 선로 시간 내 조회 완료(자기 송신 진행 중)
             const double wireMicros = charMicros_ * static_cast<double>(frame.size());
             if (after > before && elapsed >= std::chrono::duration<double, std::micro>(wireMicros * 0.5) &&
-                sampled < std::chrono::duration<double, std::micro>(wireMicros))
-                sendEcho_ = true;
+                sampled < std::chrono::duration<double, std::micro>(wireMicros)) {
+                // 대조용 선행 수신. 수신분은 다음 receive로 전달
+                if (!readQueued(after, error)) return false;
+                // 송신 중 도착분 전체가 송신 전문 선두와 일치할 때만 반향 확정. 타 전문 지연·중복 회신 잔여분 배제
+                const std::size_t fresh = carry_.size() > before ? carry_.size() - before : 0;
+                if (fresh >= kEchoProbeBytes && fresh <= frame.size() &&
+                    std::equal(carry_.begin() + static_cast<std::ptrdiff_t>(before), carry_.end(), frame.begin()))
+                    sendEcho_ = true;
+            }
         }
         return true;
     }
 
     bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
+        // 송신 중 대조용 선행 수신분 우선 전달
+        if (!carry_.empty()) {
+            inOut.insert(inOut.end(), carry_.begin(), carry_.end());
+            carry_.clear();
+            return true;
+        }
         DWORD queued = 0;
         if (!queuedBytes(queued, error)) return false;
         const DWORD waitMs = queued ? 0 : waitMilliseconds(wait);
@@ -300,6 +315,25 @@ public:
     std::wstring notice() const override { return notice_; }
 
 private:
+    // 대기열 수신분 즉시 판독 후 carry_ 끝에 추가
+    bool readQueued(DWORD count, std::wstring& error)
+    {
+        if (!applyReadWait(0)) {
+            const long code = systemError();
+            error = failure(L"직렬 수신 대기 설정 실패", code);
+            return false;
+        }
+        std::array<Byte, 4096> chunk{};
+        DWORD got = 0;
+        if (!ReadFile(handle_, chunk.data(), (std::min)(count, static_cast<DWORD>(chunk.size())), &got, nullptr)) {
+            const long code = systemError();
+            error = failure(L"직렬 수신 실패", code);
+            return false;
+        }
+        carry_.insert(carry_.end(), chunk.begin(), chunk.begin() + got);
+        return true;
+    }
+
     // 수신 대기열 크기 조회. 래치된 회선 오류는 건별 이상으로 기록
     bool queuedBytes(DWORD& bytes, std::wstring& error)
     {
@@ -359,6 +393,7 @@ private:
     DWORD readWaitMs_ = MAXDWORD;
     double charMicros_ = 0.0;  // 직렬 문자 1개 선로 시간(us)
     bool sendEcho_ = false;
+    Buffer carry_;  // 송신 중 대조용 선행 수신분. 다음 receive 선두 전달
     LineFault fault_;
     std::wstring notice_;
 };

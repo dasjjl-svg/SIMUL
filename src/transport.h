@@ -69,7 +69,7 @@ public:
     // 수신 데이터 도착 또는 wait 경과 시 반환. 도착분을 inOut 끝에 추가(1회 수용 상한 적용). false: 시험 중단 대상 치명 오류
     virtual bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) = 0;
     virtual LineFault takeFault() { return {}; }
-    // 직전 send의 송신 진행 구간 중 수신 발생 여부. 반이중 선로에서 장치 회신 불가 구간이므로 자기 송신 반향 증거
+    // 직전 send의 송신 진행 구간 중 송신 전문 선두와 동일한 바이트 수신 여부. 반이중 선로의 자기 송신 반향 증거
     virtual bool takeSendEcho() { return false; }
     // 개방 시 적용 조건 변경 등 기록 대상 안내
     virtual std::wstring notice() const { return {}; }
