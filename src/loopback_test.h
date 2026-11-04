@@ -23,8 +23,8 @@ struct TestSettings {
     TransportConfig transport;
     std::chrono::seconds duration = std::chrono::hours(1);
     std::chrono::milliseconds interval{50};       // 송신 주기 50ms 고정
-    // 회신 제한: 초과 회신은 지연 기록(판정 정상). 시험 시간 종료 후 잔여 회신 대기 기준
-    std::chrono::milliseconds echoTimeout{1000};
+    // 회신 허용 시퀀스 수: 후속 전문 replyWindow건 송신 시점까지 미회신이면 이상
+    std::uint32_t replyWindow = 5;
 };
 
 struct TestEvent {
@@ -38,8 +38,7 @@ struct TestSnapshot {
     std::uint64_t sent = 0;
     std::uint64_t received = 0;
     std::uint64_t matched = 0;
-    std::uint64_t late = 0;     // 정상 회신 중 회신 제한 초과분(지연)
-    std::uint64_t waiting = 0;  // 회신 제한 초과 미회신(회신 대기 중)
+    std::uint64_t late = 0;     // 회신 허용 시퀀스 경과 후 도착(해당 전문은 미회신 이상 처리 완료)
     std::uint64_t failed = 0;
     std::chrono::microseconds maxLatency{0};
     std::chrono::microseconds meanLatency{0};
@@ -49,12 +48,13 @@ struct TestSnapshot {
     std::chrono::milliseconds firstFailureAt{0};
     std::wstring firstFailure;
     std::wstring abortReason;  // 송·수신 치명 오류로 인한 시험 중단 사유
-    std::vector<std::uint8_t> timeline;  // 시험 시간 균등 분할 구간별 판정. 0 미도래, 1 정상, 2 지연, 3 이상
+    std::vector<std::uint8_t> timeline;  // 시험 시간 균등 분할 구간별 판정. 0 미도래, 1 정상, 2 이상
 };
 
 // 채널별 반송 시험 엔진. 작업 스레드 1개가 송·수신 처리
-// 송신 전문별 판정: 시퀀스·DATA 일치 회신 시 정상. 도착 순서 무관, 회신 제한 초과 회신은 지연 기록(판정 정상)
-// 시험 종료(잔여 회신 대기 포함)까지 미회신 또는 시퀀스 1순환(65,536 전문) 경과 미회신은 이상
+// 송신 전문별 판정: 후속 전문 replyWindow건(기본 5) 송신 전까지 시퀀스·DATA 일치 회신 시 정상. 도착 순서 무관
+// 기한 내 미회신은 이상. 기한 경과 후 도착분은 지연 회신 기록만 수행(이상 중복 계수 없음)
+// 시험 시간 종료 후 기한은 송신 주기 기준 가상 시퀀스로 판정
 // 수신 이상(전문 불량·대응 없는 전문·DATA 불일치·중복 회신·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 이상
 // RS-485 2선식 송신 반향 미발생 설정: 전문 선로 시간 1.5배(송·회신 합의 75%) 미만 사본 또는 송신 중 송신 전문 동일 바이트 수신은
 // 송신 반향으로 판정(이상 계수 후 반향 제거 전환)
@@ -65,7 +65,6 @@ public:
     static constexpr std::size_t eventQueueLimit = 1000;
     static constexpr std::chrono::minutes summaryInterval{10};   // 상세 기록 상한 도달 후 요약 주기
     static constexpr std::chrono::milliseconds idleWait{100};    // 수신 대기 상한. 통상 대기는 다음 송신 주기까지
-    static constexpr std::chrono::seconds drainCeiling{60};      // 관측 지연 기준 잔여 회신 대기 연장 상한
 
     LoopbackTest();
     ~LoopbackTest();
@@ -94,7 +93,7 @@ private:
         Clock::time_point sentAt{};
         std::uint8_t wireBytes = 0;  // DLE 치환 후 회선상 전문 길이
         bool answered = false;
-        bool overdue = false;        // 회신 제한 초과 미회신
+        bool lost = false;           // 회신 기한 경과 미회신(이상 처리 완료)
         bool localEchoSeen = false;
     };
 
@@ -105,7 +104,8 @@ private:
     void record(std::uint64_t number, const Frame& frame, std::size_t wireBytes, Clock::time_point at);
     void handleFrame(const ParseResult& parsed, const Frame& got, Clock::time_point at);
     void flushNoise();  // 누적 전문 외 수신 1건 계수
-    void markOverdue(Clock::time_point now);
+    // 후속 전문 latest번까지 송신 기준 회신 기한 경과 전문 이상 처리
+    void expireThrough(std::uint64_t latest, Clock::time_point now);
     std::wstring echoHint(const Slot& slot) const;
     void fail(std::uint64_t number, const std::wstring& text, Clock::time_point at, bool log = true,
               std::uint64_t count = 1);
@@ -131,7 +131,7 @@ private:
     TestSnapshot state_{};
     std::vector<Slot> slots_;          // 시퀀스 1순환분 송신 전문. 시험 시작 시 확보, 시험 중 추가 할당 없음
     std::uint64_t outstanding_ = 0;    // 미회신 전문 수
-    std::uint64_t overdueCursor_ = 1;  // 회신 제한 초과 판정 대상 최고(最古) 전문 번호
+    std::uint64_t expireCursor_ = 1;   // 회신 기한 판정 대상 최고(最古) 전문 번호
     std::deque<TestEvent> events_;
     std::array<std::uint8_t, timelineSlots> timeline_{};
     std::uint64_t latencySumUs_ = 0;

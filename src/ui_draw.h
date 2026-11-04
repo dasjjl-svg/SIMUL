@@ -29,7 +29,6 @@ constexpr COLORREF Fault        = RGB(220,  38,  38);
 constexpr COLORREF Halted       = RGB(180,  83,   9);  // 백색 문자 대비 5:1 이상
 constexpr COLORREF CellPass     = RGB( 34, 197,  94);
 constexpr COLORREF CellFault    = RGB(239,  68,  68);
-constexpr COLORREF CellLate     = RGB(245, 158,  11);
 constexpr COLORREF CellEmpty    = RGB(203, 213, 225);
 constexpr COLORREF White        = RGB(255, 255, 255);
 }  // namespace palette

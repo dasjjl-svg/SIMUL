@@ -37,8 +37,9 @@ constexpr std::size_t kFieldLimit = 64;
 
 constexpr unsigned long long kMinBaud = 50;
 constexpr unsigned long long kMaxBaud = 4000000;
-constexpr unsigned long long kMinEchoMs = 50;
-constexpr unsigned long long kMaxEchoMs = 10000;
+constexpr unsigned long long kMinReplyWindow = 1;     // 회신 허용 시퀀스 수 범위
+constexpr unsigned long long kMaxReplyWindow = 1000;
+constexpr const wchar_t* kDefaultReplyWindow = L"5";
 constexpr unsigned long long kMaxHours = 72;
 // 평균 전문 길이: 고정 40B + DATA·CRC 34B의 DLE 치환 기대치 0.4B
 constexpr double kMeanFrameBytes = 40.4;
@@ -475,10 +476,10 @@ void App::onInit()
     SendDlgItemMessageW(dialog_, IDC_DURATION_HOURS_SPIN, UDM_SETPOS32, 0, 1);
     SendDlgItemMessageW(dialog_, IDC_DURATION_MINUTES_SPIN, UDM_SETRANGE32, 0, 59);
     SendDlgItemMessageW(dialog_, IDC_DURATION_MINUTES_SPIN, UDM_SETPOS32, 0, 0);
-    SetDlgItemTextW(dialog_, IDC_ECHO_TIMEOUT, L"1000");
+    SetDlgItemTextW(dialog_, IDC_ECHO_TIMEOUT, kDefaultReplyWindow);
 
     Edit_LimitText(item(IDC_CHANNEL_COUNT), 2);
-    Edit_LimitText(item(IDC_ECHO_TIMEOUT), 5);
+    Edit_LimitText(item(IDC_ECHO_TIMEOUT), 4);
     Edit_LimitText(item(IDC_DURATION_HOURS), 2);
     Edit_LimitText(item(IDC_DURATION_MINUTES), 2);
     ComboBox_LimitText(item(IDC_SERIAL_PORT), 11);
@@ -802,9 +803,11 @@ void App::startTest()
     ShutdownBlockReasonCreate(dialog_, L"반송 시험 진행 중. 종료 시 시험 중지.");
     setInputsEnabled(false);
 
+    const TestSettings& first = plan.front().settings;
     appendLog(L"시험 시작. 사용 " + std::to_wstring(plan.size()) + L"채널 · 시험 시간 " +
-              clockText(std::chrono::duration_cast<std::chrono::milliseconds>(duration_)) + L" · 회신 제한 " +
-              grouped(static_cast<std::uint64_t>(plan.front().settings.echoTimeout.count())) + L" ms");
+              clockText(std::chrono::duration_cast<std::chrono::milliseconds>(duration_)) + L" · 회신 허용 시퀀스 " +
+              grouped(first.replyWindow) + L"회 (" +
+              grouped(static_cast<std::uint64_t>((first.interval * first.replyWindow).count())) + L" ms)");
     for (const Plan& entry : plan) {
         const TransportConfig& transport = entry.settings.transport;
         const bool realcom = transport.kind == TransportKind::Serial && realcomPorts_.count(transport.serial.port);
@@ -858,8 +861,7 @@ void App::finishTest()
                       ? L"전체 판정 보류. 사용자 중지로 회신 확인 미완료."
                       : L"전체 판정 보류. 사용자 중지로 시험 시간 미완료.");
     } else {
-        appendLog(L"전체 판정 OK. 사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 회신." +
-                  (result.late ? L" 회신 제한 초과 지연 " + grouped(result.late) + L"건 포함." : std::wstring()));
+        appendLog(L"전체 판정 OK. 사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 회신.");
     }
     refreshRows();
     refreshDetail();
@@ -1037,7 +1039,7 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
     unsigned long long count = 0;
     unsigned long long hours = 0;
     unsigned long long minutes = 0;
-    unsigned long long echo = 0;
+    unsigned long long window = 0;
     if (!parseNumber(trimmed(text(IDC_CHANNEL_COUNT)), kMaxChannels, count) || count != channelCount_) {
         error = L"채널 수 범위 오류. 1~32 지정.";
         field = IDC_CHANNEL_COUNT;
@@ -1059,8 +1061,8 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
         field = seconds < 60 ? IDC_DURATION_MINUTES : IDC_DURATION_HOURS;
         return false;
     }
-    if (!parseNumber(trimmed(text(IDC_ECHO_TIMEOUT)), kMaxEchoMs, echo) || echo < kMinEchoMs) {
-        error = L"회신 제한 범위 오류. 50~10,000 ms 지정.";
+    if (!parseNumber(trimmed(text(IDC_ECHO_TIMEOUT)), kMaxReplyWindow, window) || window < kMinReplyWindow) {
+        error = L"회신 허용 범위 오류. 1~1,000 시퀀스 지정.";
         field = IDC_ECHO_TIMEOUT;
         return false;
     }
@@ -1075,7 +1077,7 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
         }
         entry.settings.duration = std::chrono::seconds(static_cast<long long>(seconds));
         entry.settings.interval = std::chrono::milliseconds(50);
-        entry.settings.echoTimeout = std::chrono::milliseconds(static_cast<long long>(echo));
+        entry.settings.replyWindow = static_cast<std::uint32_t>(window);
         plan.push_back(entry);
     }
 
@@ -1160,7 +1162,8 @@ void App::loadSettings()
         SetDlgItemTextW(dialog_, IDC_DURATION_HOURS, value.c_str());
     if (readRegistryText(key, L"DurationMinutes", value) && parseNumber(value, 59, number))
         SetDlgItemTextW(dialog_, IDC_DURATION_MINUTES, value.c_str());
-    if (readRegistryText(key, L"EchoTimeoutMs", value) && parseNumber(value, kMaxEchoMs, number) && number >= kMinEchoMs)
+    if (readRegistryText(key, L"ReplyWindow", value) && parseNumber(value, kMaxReplyWindow, number) &&
+        number >= kMinReplyWindow)
         SetDlgItemTextW(dialog_, IDC_ECHO_TIMEOUT, value.c_str());
     RegCloseKey(key);
 }
@@ -1174,7 +1177,7 @@ void App::saveSettings() const
     for (std::size_t i = 0; i < kMaxChannels; ++i) writeRegistryText(key, channelValueName(i).c_str(), encodeForm(forms_[i]));
     writeRegistryText(key, L"DurationHours", trimmed(text(IDC_DURATION_HOURS)));
     writeRegistryText(key, L"DurationMinutes", trimmed(text(IDC_DURATION_MINUTES)));
-    writeRegistryText(key, L"EchoTimeoutMs", trimmed(text(IDC_ECHO_TIMEOUT)));
+    writeRegistryText(key, L"ReplyWindow", trimmed(text(IDC_ECHO_TIMEOUT)));
     RegCloseKey(key);
 }
 
@@ -1418,10 +1421,6 @@ bool App::rowVerdict(std::size_t row, COLORREF& face, COLORREF& ink, std::wstrin
     if (view.verdict == Verdict::Fail) {
         face = ui::palette::Fault;
         label = L"FAIL";
-    } else if (view.running && view.waiting) {
-        // 회신 제한 초과 미회신 대기: 판정 미확정 주의 표시
-        face = ui::palette::Halted;
-        label = L"지연";
     } else if (view.running) {
         face = ui::palette::Running;
         label = L"시험 중";
@@ -1637,8 +1636,6 @@ App::Overall App::overall() const
         const TestSnapshot& view = views_[i];
         ++result.channels;
         result.matched += view.matched;
-        result.late += view.late;
-        if (view.running) result.waiting += view.waiting;
         result.elapsed = (std::max)(result.elapsed, view.elapsed);
         if (view.verdict == Verdict::Fail) {
             ++result.failedChannels;
@@ -1691,10 +1688,8 @@ ui::VerdictView App::verdictView() const
     } else if (running_) {
         view.color = ui::palette::Running;
         view.state = L"시험 중";
-        view.detail = L"사용 " + std::to_wstring(result.channels) + L"채널 · 정상 회신 " + grouped(result.matched) + L"건" +
-                      (result.waiting ? L" · 회신 대기 " + grouped(result.waiting) + L"건" : std::wstring()) +
-                      (result.late ? L" · 지연 " + grouped(result.late) + L"건" : std::wstring()) + L" · " +
-                      (elapsed >= total ? std::wstring(L"잔여 회신 대기") : L"잔여 " + clockText(total - elapsed));
+        view.detail = L"사용 " + std::to_wstring(result.channels) + L"채널 · 정상 회신 " + grouped(result.matched) +
+                      L"건 · " + (elapsed >= total ? std::wstring(L"잔여 회신 대기") : L"잔여 " + clockText(total - elapsed));
     } else if (result.stopped) {
         view.color = ui::palette::Halted;
         view.state = L"보류";
@@ -1703,8 +1698,7 @@ ui::VerdictView App::verdictView() const
         view.color = ui::palette::Pass;
         view.state = L"OK";
         view.detail = L"사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 · 정상 회신 " +
-                      grouped(result.matched) + L"건" +
-                      (result.late ? L" (지연 " + grouped(result.late) + L"건 포함)" : std::wstring());
+                      grouped(result.matched) + L"건";
     }
     return view;
 }
@@ -1717,10 +1711,8 @@ std::wstring App::channelDetail() const
     const std::wstring latency = view.matched
                                      ? L"최대 지연 " + msText(view.maxLatency) + L" · 평균 " + msText(view.meanLatency)
                                      : std::wstring(L"정상 회신 없음");
-    // 회신 제한 초과 정상 회신(지연)·미회신 대기 건수
-    const std::wstring lateness = (view.late ? L" · 지연 " + grouped(view.late) + L"건" : std::wstring()) +
-                                  (view.running && view.waiting ? L" · 회신 대기 " + grouped(view.waiting) + L"건"
-                                                                : std::wstring());
+    // 회신 허용 시퀀스 경과 후 도착 건수(해당 전문은 미회신 이상)
+    const std::wstring lateness = view.late ? L" · 지연 회신 " + grouped(view.late) + L"건" : std::wstring();
     const std::wstring failure = !view.abortReason.empty() ? L"시험 중단 · " + view.abortReason
                                  : view.hasFailure ? L"최초 이상 " + clockText(view.firstFailureAt, true) + L" · " + view.firstFailure
                                                    : std::wstring(L"이상 없음");

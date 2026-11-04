@@ -133,7 +133,13 @@ void enlargeReceiveBuffer(SOCKET socket)
 
 class SerialTransport : public Transport {
 public:
-    explicit SerialTransport(const SerialConfig& config) : config_(config) { txBuffer_.reserve(MAX_FRAME_SIZE); }
+    explicit SerialTransport(const SerialConfig& config) : config_(config)
+    {
+        const double stop = config.stopBits == ONESTOPBIT ? 1.0 : config.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
+        const double bits = 1.0 + config.dataBits + (config.parity != NOPARITY ? 1.0 : 0.0) + stop;
+        charMicros_ = config.baud ? bits * 1e6 / static_cast<double>(config.baud) : 0.0;
+        txBuffer_.reserve(MAX_FRAME_SIZE);
+    }
     ~SerialTransport() override { close(); }
 
     bool open(std::wstring& error) override
@@ -242,13 +248,15 @@ public:
     bool send(const Buffer& frame, std::wstring& error) override
     {
         // 직전 송신 완료 대기. 송신 버퍼·OVERLAPPED 재사용 전제(통상 직전 주기 내 완료)
-        if (!finishWrite(true, error)) return false;
+        if (!finishWrite(error)) return false;
         txBuffer_.assign(frame.begin(), frame.end());
         echoMatched_ = 0;
         echoBroken_ = false;
         ResetEvent(writeEvent_);
         writeIo_ = OVERLAPPED{};
         writeIo_.hEvent = writeEvent_;
+        // 반향 대조 구간 기준 시각. 선로 송신 개시는 WriteFile 호출 이후
+        writeIssued_ = std::chrono::steady_clock::now();
         if (!WriteFile(handle_, txBuffer_.data(), static_cast<DWORD>(txBuffer_.size()), nullptr, &writeIo_)) {
             const long code = systemError();
             if (code != ERROR_IO_PENDING) {
@@ -262,8 +270,6 @@ public:
 
     bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
-        // 완료된 송신 결과 수집(대기 없음). 송신 시간 초과·오류 즉시 보고
-        if (!finishWrite(false, error)) return false;
         DWORD queued = 0;
         if (!queuedBytes(queued, error)) return false;
         const DWORD waitMs = queued ? 0 : waitMilliseconds(wait);
@@ -331,19 +337,17 @@ private:
         return true;
     }
 
-    // 진행 중 송신 결과 수집. wait=false: 미완료 시 다음 호출로 연기
-    // wait=true: 송신 처리 상한 경과 시 자체 취소, 송신 시간 초과로 판정
-    bool finishWrite(bool wait, std::wstring& error)
+    // 직전 송신 완료 대기·결과 수집. 송신 처리 상한 경과 시 자체 취소 후 송신 시간 초과 판정
+    bool finishWrite(std::wstring& error)
     {
         if (!writePending_) return true;
-        if (wait && WaitForSingleObject(writeEvent_, kSendTimeoutMs + kIoGuardMs) == WAIT_TIMEOUT)
-            CancelIoEx(handle_, &writeIo_);
+        const bool cancelled = WaitForSingleObject(writeEvent_, kSendTimeoutMs + kIoGuardMs) == WAIT_TIMEOUT &&
+                               CancelIoEx(handle_, &writeIo_);
         DWORD written = 0;
-        if (!GetOverlappedResult(handle_, &writeIo_, &written, wait ? TRUE : FALSE)) {
+        if (!GetOverlappedResult(handle_, &writeIo_, &written, TRUE)) {
             const long code = systemError();
-            if (!wait && code == ERROR_IO_INCOMPLETE) return true;
             writePending_ = false;
-            if (code == ERROR_OPERATION_ABORTED) {
+            if (cancelled && code == ERROR_OPERATION_ABORTED) {
                 error = L"직렬 송신 시간 초과 (" + std::to_wstring(written) + L"/" + std::to_wstring(txBuffer_.size()) +
                         L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
                 return false;
@@ -361,12 +365,15 @@ private:
     }
 
     // RS-485 2선식: 송신 진행 중 도착분과 송신 전문 선두 대조. 반이중 선로상 장치 회신 불가 구간
-    // 송신 완료 후 도착분 또는 불일치 바이트 발생 시 해당 전문 대조 종료. 타 전문 지연·중복 회신 잔여분 배제
+    // 대조 구간: 송신 미완료 + WriteFile 호출 후 전문 선로 시간 이내(송신 완료 통지가 늦은 드라이버의 장치 회신 배제)
+    // 구간 경과 후 도착분 또는 불일치 바이트 발생 시 해당 전문 대조 종료. 타 전문 지연·중복 회신 잔여분 배제
     void probeEcho(DWORD got)
     {
         if (echoBroken_) return;
+        const auto onWire = std::chrono::duration<double, std::micro>(charMicros_ * static_cast<double>(txBuffer_.size()));
         DWORD written = 0;
-        const bool writing = writePending_ && !GetOverlappedResult(handle_, &writeIo_, &written, FALSE) &&
+        const bool writing = writePending_ && std::chrono::steady_clock::now() - writeIssued_ < onWire &&
+                             !GetOverlappedResult(handle_, &writeIo_, &written, FALSE) &&
                              GetLastError() == ERROR_IO_INCOMPLETE;
         if (!writing) {
             echoBroken_ = true;
@@ -446,6 +453,8 @@ private:
     OVERLAPPED readIo_{};
     OVERLAPPED writeIo_{};
     bool writePending_ = false;
+    std::chrono::steady_clock::time_point writeIssued_{};  // 최근 WriteFile 호출 시각
+    double charMicros_ = 0.0;           // 직렬 문자 1개 선로 시간(us)
     Buffer txBuffer_;                   // 진행 중 송신 전문. 송신 완료까지 유지
     std::array<Byte, 4096> rxChunk_{};  // 비동기 수신 버퍼
     DWORD readWaitMs_ = MAXDWORD;

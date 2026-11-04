@@ -23,9 +23,9 @@ BEGIN
     CONTROL         "", IDC_CHANNEL_COUNT_SPIN, "msctls_updown32",
                     UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_AUTOBUDDY | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
                     0, 0, 10, 14
-    LTEXT           "회신 제한", IDC_ECHO_LABEL, 562, 53, 42, 8
+    LTEXT           "회신 허용", IDC_ECHO_LABEL, 562, 53, 42, 8
     EDITTEXT        IDC_ECHO_TIMEOUT, 606, 50, 50, 14, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "ms", IDC_ECHO_UNIT, 660, 53, 20, 8
+    LTEXT           "시퀀스", IDC_ECHO_UNIT, 660, 53, 34, 8
     LTEXT           "시험 시간", IDC_DURATION_LABEL, 424, 71, 42, 8
     EDITTEXT        IDC_DURATION_HOURS, 466, 68, 36, 14, ES_AUTOHSCROLL | ES_NUMBER
     CONTROL         "", IDC_DURATION_HOURS_SPIN, "msctls_updown32",
