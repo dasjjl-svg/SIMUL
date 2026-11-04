@@ -119,6 +119,8 @@ private:
     void appendEvents();
     void updateTitle();
     void refreshFonts();
+    // 창·작업 표시줄 아이콘과 상단 로고를 현재 DPI 크기로 재적재
+    void refreshIcons();
     void invalidateVerdict();
     void holdProcessResources();
     void releaseSystemHolds();
@@ -135,6 +137,11 @@ private:
     ui::FontCache fonts_;
     HBRUSH surfaceBrush_ = nullptr;
     HBRUSH disabledBrush_ = nullptr;
+    HINSTANCE instance_ = nullptr;
+    HICON bigIcon_ = nullptr;
+    HICON smallIcon_ = nullptr;
+    HICON headerIcon_ = nullptr;
+    int headerIconSize_ = 0;
 
     std::array<ChannelForm, kMaxChannels> forms_{};
     std::array<std::unique_ptr<LoopbackTest>, kMaxChannels> tests_{};

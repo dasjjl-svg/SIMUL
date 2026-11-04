@@ -28,9 +28,9 @@ add_executable(loopback_tester WIN32
     src/loopback_tester.rc
 )
 
-# 리소스 내장 매니페스트 변경 시 리소스 재컴파일
+# 리소스 내장 매니페스트·아이콘 변경 시 리소스 재컴파일
 set_source_files_properties(src/loopback_tester.rc PROPERTIES
-    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/loopback_tester.manifest")
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/loopback_tester.manifest;${CMAKE_CURRENT_SOURCE_DIR}/src/loopback_tester.ico")
 
 target_include_directories(loopback_tester PRIVATE src)
 target_compile_definitions(loopback_tester PRIVATE

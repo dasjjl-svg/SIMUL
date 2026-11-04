@@ -54,11 +54,14 @@ struct VerdictView {
     std::wstring percent;
 };
 
+// 창의 현재 DPI. 미지원 환경은 화면 DC 기준
+int dpiFor(HWND window);
 // 대화상자 기본 글꼴 9pt의 현재 DPI 기준 픽셀 높이
 int basePixels(HWND window);
 
-void paintHeader(HDC dc, const RECT& rc, FontCache& fonts, int base, const std::wstring& title,
-                 const std::wstring& subtitle, const std::wstring& note);
+// mark: 제목 앞 로고(markSize 정사각). nullptr이면 생략
+void paintHeader(HDC dc, const RECT& rc, FontCache& fonts, int base, HICON mark, int markSize,
+                 const std::wstring& title, const std::wstring& subtitle, const std::wstring& note);
 void paintVerdict(HDC dc, const RECT& rc, FontCache& fonts, int base, const VerdictView& view);
 // 목록 셀 내부 표시. 이중 버퍼 미사용, 호출측 DC에 직접 출력
 // slots: 시험 시간 균등 분할 구간별 판정(0 미도래, 1 정상, 2 이상). 셀 폭에 맞춰 구간 병합, 이상 우선

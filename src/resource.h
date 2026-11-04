@@ -1,5 +1,6 @@
 #pragma once
 
+#define IDI_APP                     1
 #define IDD_MAIN                    100
 
 #define IDC_HEADER                  1000

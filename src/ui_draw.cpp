@@ -135,7 +135,7 @@ HFONT FontCache::get(int pixelHeight, int weight)
     return font;
 }
 
-int basePixels(HWND window)
+int dpiFor(HWND window)
 {
     using DpiForWindow = UINT(WINAPI*)(HWND);
     static const auto dpiForWindow = reinterpret_cast<DpiForWindow>(
@@ -146,11 +146,16 @@ int basePixels(HWND window)
         dpi = static_cast<UINT>(GetDeviceCaps(dc, LOGPIXELSY));
         ReleaseDC(window, dc);
     }
-    return MulDiv(9, static_cast<int>(dpi ? dpi : 96), 72);
+    return static_cast<int>(dpi ? dpi : 96);
 }
 
-void paintHeader(HDC target, const RECT& rc, FontCache& fonts, int base, const std::wstring& title,
-                 const std::wstring& subtitle, const std::wstring& note)
+int basePixels(HWND window)
+{
+    return MulDiv(9, dpiFor(window), 72);
+}
+
+void paintHeader(HDC target, const RECT& rc, FontCache& fonts, int base, HICON mark, int markSize,
+                 const std::wstring& title, const std::wstring& subtitle, const std::wstring& note)
 {
     Buffered buffer(target, rc);
     const HDC dc = buffer.dc();
@@ -161,6 +166,12 @@ void paintHeader(HDC target, const RECT& rc, FontCache& fonts, int base, const s
 
     const int pad = base + base / 3;
     RECT area{rc.left + pad, rc.top, rc.right - pad, accent.top};
+    // 로고: 강조선 위 영역 세로 중앙, 제목은 로고 오른쪽
+    if (mark && markSize > 0) {
+        const int top = static_cast<int>(area.top + (area.bottom - area.top - markSize) / 2);
+        DrawIconEx(dc, area.left, top, mark, markSize, markSize, 0, nullptr, DI_NORMAL);
+        area.left += markSize + base / 2;
+    }
     const HFONT titleFont = fonts.get(base * 8 / 5, FW_BOLD);
     label(dc, area, title, titleFont, palette::White, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     RECT sub = area;

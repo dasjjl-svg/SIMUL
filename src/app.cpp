@@ -370,10 +370,13 @@ App::~App()
     releaseSystemHolds();
     if (surfaceBrush_) DeleteObject(surfaceBrush_);
     if (disabledBrush_) DeleteObject(disabledBrush_);
+    for (HICON icon : {bigIcon_, smallIcon_, headerIcon_})
+        if (icon) DestroyIcon(icon);
 }
 
 int App::run(HINSTANCE instance)
 {
+    instance_ = instance;
     INITCOMMONCONTROLSEX controls{};
     controls.dwSize = sizeof(controls);
     controls.dwICC = ICC_STANDARD_CLASSES | ICC_UPDOWN_CLASS | ICC_LISTVIEW_CLASSES;
@@ -427,6 +430,7 @@ INT_PTR App::handle(UINT message, WPARAM wParam, LPARAM lParam)
         return FALSE;
     case kRefreshFontsMessage:
         refreshFonts();
+        refreshIcons();
         sizeColumns();
         InvalidateRect(dialog_, nullptr, TRUE);
         return TRUE;
@@ -461,6 +465,7 @@ void App::onInit()
     surfaceBrush_ = CreateSolidBrush(ui::palette::Surface);
     disabledBrush_ = CreateSolidBrush(ui::palette::Muted);
     refreshFonts();
+    refreshIcons();
 
     fillCombo(item(IDC_TRANSPORT_COMBO), kKindNames, std::size(kKindNames));
     fillCombo(item(IDC_SERIAL_STANDARD), kStandardNames, std::size(kStandardNames));
@@ -672,7 +677,8 @@ void App::onDrawItem(const DRAWITEMSTRUCT& draw)
     const int base = ui::basePixels(dialog_);
     switch (draw.CtlID) {
     case IDC_HEADER:
-        ui::paintHeader(draw.hDC, draw.rcItem, fonts_, base, kAppTitle, L"인터페이스 장치 반송 시험", L"v1.0");
+        ui::paintHeader(draw.hDC, draw.rcItem, fonts_, base, headerIcon_, headerIconSize_, kAppTitle,
+                        L"인터페이스 장치 반송 시험", L"v1.0");
         break;
     case IDC_VERDICT:
         ui::paintVerdict(draw.hDC, draw.rcItem, fonts_, base, verdictView());
@@ -1571,6 +1577,34 @@ void App::appendEvents()
     std::stable_sort(batch.begin(), batch.end(),
                      [](const auto& a, const auto& b) { return a.second.wall < b.second.wall; });
     for (const auto& entry : batch) appendLog(channelName(entry.first) + L" · " + entry.second.text, entry.second.wall);
+}
+
+void App::refreshIcons()
+{
+    // 제목 표시줄 16, Alt+Tab·작업 표시줄 32(현재 DPI 배율), 상단 로고는 기준 글꼴 2배
+    const int dpi = ui::dpiFor(dialog_);
+    const auto load = [this](int size) {
+        HICON icon = nullptr;
+        if (FAILED(LoadIconWithScaleDown(instance_, MAKEINTRESOURCEW(IDI_APP), size, size, &icon))) return HICON{};
+        return icon;
+    };
+    const HICON largeIcon = load(MulDiv(32, dpi, 96));
+    const HICON titleIcon = load(MulDiv(16, dpi, 96));
+    const int markSize = ui::basePixels(dialog_) * 2;
+    const HICON markIcon = load(markSize);
+    if (largeIcon) SendMessageW(dialog_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(largeIcon));
+    if (titleIcon) SendMessageW(dialog_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(titleIcon));
+    // 창 보유분 교체 후 이전 아이콘 해제
+    const auto replace = [](HICON& slot, HICON fresh) {
+        if (!fresh) return;
+        if (slot) DestroyIcon(slot);
+        slot = fresh;
+    };
+    replace(bigIcon_, largeIcon);
+    replace(smallIcon_, titleIcon);
+    replace(headerIcon_, markIcon);
+    if (markIcon) headerIconSize_ = markSize;
+    InvalidateRect(item(IDC_HEADER), nullptr, FALSE);
 }
 
 void App::refreshFonts()
