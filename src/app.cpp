@@ -821,7 +821,7 @@ void App::startTest()
 void App::stopTest()
 {
     if (!running_) return;
-    if (MessageBoxW(dialog_, L"시험 진행 중. 중지 시 시험 종료, 시험 시간 미완료 채널은 판정 보류 (FAIL 채널은 FAIL 유지).\n\n시험 중지?",
+    if (MessageBoxW(dialog_, L"시험 진행 중. 중지 시 시험 종료, 시험 시간 또는 회신 확인 미완료 채널은 판정 보류 (FAIL 채널은 FAIL 유지).\n\n시험 중지?",
                     kAppTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
         return;
     finishTest();
@@ -853,9 +853,13 @@ void App::finishTest()
     if (result.failedChannels) {
         appendLog(L"전체 판정 FAIL. FAIL " + std::to_wstring(result.failedChannels) + L"채널 (" + result.failedList + L").");
     } else if (result.stopped) {
-        appendLog(L"전체 판정 보류. 사용자 중지로 시험 시간 미완료.");
+        // 시험 시간 경과 후 중지: 잔여 회신 대기 중 중지
+        appendLog(result.elapsed >= std::chrono::duration_cast<std::chrono::milliseconds>(duration_)
+                      ? L"전체 판정 보류. 사용자 중지로 회신 확인 미완료."
+                      : L"전체 판정 보류. 사용자 중지로 시험 시간 미완료.");
     } else {
-        appendLog(L"전체 판정 OK. 사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 회신.");
+        appendLog(L"전체 판정 OK. 사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 회신." +
+                  (result.late ? L" 회신 제한 초과 지연 " + grouped(result.late) + L"건 포함." : std::wstring()));
     }
     refreshRows();
     refreshDetail();
@@ -1119,7 +1123,7 @@ std::wstring App::planWarnings(const std::vector<Plan>& plan) const
         const SerialConfig& serial = entry.settings.transport.serial;
         if (serial.dataBits < 8)
             add(entry.channel, L"데이터 비트 " + std::to_wstring(serial.dataBits) +
-                                   L". 8비트 전문 바이트(C0·C1·FF 등) 전송 불가로 판정 FAIL 예상, 데이터 비트 8 지정 필요.");
+                                   L". 8비트 전문 바이트(시퀀스·DATA·FF 등) 전송 불가로 판정 FAIL 예상, 데이터 비트 8 지정 필요.");
         // 반향 오설정 자동 검출은 송신 완료 대기형 직렬 포트 또는 저속 조건 한정
         if (serial.standard == SerialStandard::Rs485TwoWire && serial.localEcho == LocalEcho::Absent)
             add(entry.channel, L"RS-485 2선식 송신 반향 미발생 설정. USB·네트워크 변환기는 송신 반향 오설정 자동 검출 불가, "
@@ -1414,6 +1418,10 @@ bool App::rowVerdict(std::size_t row, COLORREF& face, COLORREF& ink, std::wstrin
     if (view.verdict == Verdict::Fail) {
         face = ui::palette::Fault;
         label = L"FAIL";
+    } else if (view.running && view.waiting) {
+        // 회신 제한 초과 미회신 대기: 판정 미확정 주의 표시
+        face = ui::palette::Halted;
+        label = L"지연";
     } else if (view.running) {
         face = ui::palette::Running;
         label = L"시험 중";
@@ -1629,6 +1637,8 @@ App::Overall App::overall() const
         const TestSnapshot& view = views_[i];
         ++result.channels;
         result.matched += view.matched;
+        result.late += view.late;
+        if (view.running) result.waiting += view.waiting;
         result.elapsed = (std::max)(result.elapsed, view.elapsed);
         if (view.verdict == Verdict::Fail) {
             ++result.failedChannels;
@@ -1681,17 +1691,20 @@ ui::VerdictView App::verdictView() const
     } else if (running_) {
         view.color = ui::palette::Running;
         view.state = L"시험 중";
-        view.detail = L"사용 " + std::to_wstring(result.channels) + L"채널 · 정상 회신 " + grouped(result.matched) +
-                      L"건 · " + (elapsed >= total ? std::wstring(L"잔여 회신 대기") : L"잔여 " + clockText(total - elapsed));
+        view.detail = L"사용 " + std::to_wstring(result.channels) + L"채널 · 정상 회신 " + grouped(result.matched) + L"건" +
+                      (result.waiting ? L" · 회신 대기 " + grouped(result.waiting) + L"건" : std::wstring()) +
+                      (result.late ? L" · 지연 " + grouped(result.late) + L"건" : std::wstring()) + L" · " +
+                      (elapsed >= total ? std::wstring(L"잔여 회신 대기") : L"잔여 " + clockText(total - elapsed));
     } else if (result.stopped) {
         view.color = ui::palette::Halted;
         view.state = L"보류";
-        view.detail = L"사용자 중지 · 시험 시간 미완료";
+        view.detail = elapsed >= total ? L"사용자 중지 · 회신 확인 미완료" : L"사용자 중지 · 시험 시간 미완료";
     } else {
         view.color = ui::palette::Pass;
         view.state = L"OK";
         view.detail = L"사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 · 정상 회신 " +
-                      grouped(result.matched) + L"건";
+                      grouped(result.matched) + L"건" +
+                      (result.late ? L" (지연 " + grouped(result.late) + L"건 포함)" : std::wstring());
     }
     return view;
 }
@@ -1704,10 +1717,14 @@ std::wstring App::channelDetail() const
     const std::wstring latency = view.matched
                                      ? L"최대 지연 " + msText(view.maxLatency) + L" · 평균 " + msText(view.meanLatency)
                                      : std::wstring(L"정상 회신 없음");
+    // 회신 제한 초과 정상 회신(지연)·미회신 대기 건수
+    const std::wstring lateness = (view.late ? L" · 지연 " + grouped(view.late) + L"건" : std::wstring()) +
+                                  (view.running && view.waiting ? L" · 회신 대기 " + grouped(view.waiting) + L"건"
+                                                                : std::wstring());
     const std::wstring failure = !view.abortReason.empty() ? L"시험 중단 · " + view.abortReason
                                  : view.hasFailure ? L"최초 이상 " + clockText(view.firstFailureAt, true) + L" · " + view.firstFailure
                                                    : std::wstring(L"이상 없음");
-    return name + L"수신 " + grouped(view.received) + L"건 · " + latency + L"\n" + failure;
+    return name + L"수신 " + grouped(view.received) + L"건 · " + latency + lateness + L"\n" + failure;
 }
 
 int App::dluToPixels(int units) const

@@ -24,7 +24,8 @@ namespace {
 constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스레드 정지 시간 제한
 constexpr DWORD kSendTimeoutMs    = 250;   // 전문 1건 송신 처리 상한. 송신 주기 50ms의 5배
 constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
-constexpr std::size_t kEchoProbeBytes = 8;  // 송신 반향 대조 최소 바이트. STX·C0·C1 공통 선두 외 DATA 5바이트 이상 포함
+constexpr DWORD kIoGuardMs = 2;          // 대기 상한(COMMTIMEOUTS) 미준수 드라이버 대비 자체 대기 여유
+constexpr std::size_t kEchoProbeBytes = 8;  // 송신 반향 확정 최소 일치 바이트. STX·시퀀스 외 DATA 5바이트 이상
 constexpr int   kSocketBufferBytes = 262144;  // 소켓 수신 버퍼. 작업 스레드 지연 구간 데이터그램 보존
 constexpr std::size_t kReceiveBurstBytes = 65536;     // receive 1회 수용 상한. 연속 유입 시 송신 주기 처리 기회 보장
 constexpr std::size_t kReceiveBurstDatagrams = 1024;  // UDP receive 1회 수용 데이터그램 상한
@@ -132,26 +133,30 @@ void enlargeReceiveBuffer(SOCKET socket)
 
 class SerialTransport : public Transport {
 public:
-    explicit SerialTransport(const SerialConfig& config) : config_(config)
-    {
-        const double stop = config.stopBits == ONESTOPBIT ? 1.0 : config.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
-        const double bits = 1.0 + config.dataBits + (config.parity != NOPARITY ? 1.0 : 0.0) + stop;
-        charMicros_ = config.baud ? bits * 1e6 / static_cast<double>(config.baud) : 0.0;
-        carry_.reserve(4096);
-    }
+    explicit SerialTransport(const SerialConfig& config) : config_(config) { txBuffer_.reserve(MAX_FRAME_SIZE); }
     ~SerialTransport() override { close(); }
 
     bool open(std::wstring& error) override
     {
         close();
         const std::wstring path = L"\\\\.\\" + config_.port;
-        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        // 비동기 입출력: 송신 진행 중에도 수신 완료 즉시 처리(동기 핸들은 송·수신 직렬화로 회신 시각 지연)
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OVERLAPPED, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) {
             const long code = systemError();
             const wchar_t* hint = code == ERROR_ACCESS_DENIED ? L". 타 프로그램 점유"
                                   : code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND ? L". 포트 미존재"
                                                                                                  : L"";
             error = failure(config_.port + L" 열기 실패" + hint, code);
+            return false;
+        }
+        readEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        writeEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!readEvent_ || !writeEvent_) {
+            const long code = systemError();
+            error = failure(config_.port + L" 입출력 이벤트 생성 실패", code);
+            close();
             return false;
         }
 
@@ -217,57 +222,48 @@ public:
 
     void close() override
     {
-        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
-        handle_ = INVALID_HANDLE_VALUE;
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            // 진행 중 송신 취소 후 완료 대기. OVERLAPPED·송신 버퍼 해제 전 입출력 종료 보장
+            if (writePending_) {
+                CancelIoEx(handle_, &writeIo_);
+                DWORD ignored = 0;
+                GetOverlappedResult(handle_, &writeIo_, &ignored, TRUE);
+                writePending_ = false;
+            }
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+        if (readEvent_) CloseHandle(readEvent_);
+        if (writeEvent_) CloseHandle(writeEvent_);
+        readEvent_ = nullptr;
+        writeEvent_ = nullptr;
     }
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        // RS-485 2선식: 송신 중 수신 바이트와 송신 전문 선두 대조로 자기 송신 반향 증거 수집
-        const bool halfDuplex = config_.standard == SerialStandard::Rs485TwoWire;
-        DWORD before = 0;
-        if (halfDuplex && !queuedBytes(before, error)) return false;
-        const auto started = std::chrono::steady_clock::now();
-        DWORD written = 0;
-        if (!WriteFile(handle_, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr)) {
+        // 직전 송신 완료 대기. 송신 버퍼·OVERLAPPED 재사용 전제(통상 직전 주기 내 완료)
+        if (!finishWrite(true, error)) return false;
+        txBuffer_.assign(frame.begin(), frame.end());
+        echoMatched_ = 0;
+        echoBroken_ = false;
+        ResetEvent(writeEvent_);
+        writeIo_ = OVERLAPPED{};
+        writeIo_.hEvent = writeEvent_;
+        if (!WriteFile(handle_, txBuffer_.data(), static_cast<DWORD>(txBuffer_.size()), nullptr, &writeIo_)) {
             const long code = systemError();
-            error = failure(L"직렬 송신 실패", code);
-            return false;
-        }
-        if (written != frame.size()) {
-            error = L"직렬 송신 시간 초과 (" + std::to_wstring(written) + L"/" + std::to_wstring(frame.size()) +
-                    L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
-            return false;
-        }
-        if (halfDuplex) {
-            const auto elapsed = std::chrono::steady_clock::now() - started;
-            DWORD after = 0;
-            if (!queuedBytes(after, error)) return false;
-            const auto sampled = std::chrono::steady_clock::now() - started;
-            // 표본 유효 조건: 송신 완료 대기형 쓰기(소요 ≥ 선로 시간 절반) + 전문 선로 시간 내 조회 완료(자기 송신 진행 중)
-            const double wireMicros = charMicros_ * static_cast<double>(frame.size());
-            if (after > before && elapsed >= std::chrono::duration<double, std::micro>(wireMicros * 0.5) &&
-                sampled < std::chrono::duration<double, std::micro>(wireMicros)) {
-                // 대조용 선행 수신. 수신분은 다음 receive로 전달
-                if (!readQueued(after, error)) return false;
-                // 송신 중 도착분 전체가 송신 전문 선두와 일치할 때만 반향 확정. 타 전문 지연·중복 회신 잔여분 배제
-                const std::size_t fresh = carry_.size() > before ? carry_.size() - before : 0;
-                if (fresh >= kEchoProbeBytes && fresh <= frame.size() &&
-                    std::equal(carry_.begin() + static_cast<std::ptrdiff_t>(before), carry_.end(), frame.begin()))
-                    sendEcho_ = true;
+            if (code != ERROR_IO_PENDING) {
+                error = failure(L"직렬 송신 실패", code);
+                return false;
             }
         }
+        writePending_ = true;
         return true;
     }
 
     bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
-        // 송신 중 대조용 선행 수신분 우선 전달
-        if (!carry_.empty()) {
-            inOut.insert(inOut.end(), carry_.begin(), carry_.end());
-            carry_.clear();
-            return true;
-        }
+        // 완료된 송신 결과 수집(대기 없음). 송신 시간 초과·오류 즉시 보고
+        if (!finishWrite(false, error)) return false;
         DWORD queued = 0;
         if (!queuedBytes(queued, error)) return false;
         const DWORD waitMs = queued ? 0 : waitMilliseconds(wait);
@@ -278,17 +274,13 @@ public:
             return false;
         }
 
-        std::array<Byte, 4096> chunk{};
-        const DWORD toRead = queued ? (std::min)(queued, static_cast<DWORD>(chunk.size()))
-                                    : static_cast<DWORD>(chunk.size());
+        const DWORD toRead = queued ? (std::min)(queued, static_cast<DWORD>(rxChunk_.size()))
+                                    : static_cast<DWORD>(rxChunk_.size());
         const auto begun = std::chrono::steady_clock::now();
         DWORD got = 0;
-        if (!ReadFile(handle_, chunk.data(), toRead, &got, nullptr)) {
-            const long code = systemError();
-            error = failure(L"직렬 수신 실패", code);
-            return false;
-        }
-        inOut.insert(inOut.end(), chunk.begin(), chunk.begin() + got);
+        if (!read(toRead, waitMs, got, error)) return false;
+        if (got && config_.standard == SerialStandard::Rs485TwoWire) probeEcho(got);
+        inOut.insert(inOut.end(), rxChunk_.begin(), rxChunk_.begin() + got);
         if (waitMs) {
             // 대기 중 도착 바이트의 회선 오류 즉시 수집. 시험 종료 직전 최종 회신의 오류 누락 방지
             if (got && !queuedBytes(queued, error)) return false;
@@ -315,23 +307,82 @@ public:
     std::wstring notice() const override { return notice_; }
 
 private:
-    // 대기열 수신분 즉시 판독 후 carry_ 끝에 추가
-    bool readQueued(DWORD count, std::wstring& error)
+    // 비동기 수신 개시 후 완료 대기. 대기 상한 경과 시 자체 취소(취소 전 수신분 유지)
+    bool read(DWORD count, DWORD waitMs, DWORD& got, std::wstring& error)
     {
-        if (!applyReadWait(0)) {
+        got = 0;
+        ResetEvent(readEvent_);
+        readIo_ = OVERLAPPED{};
+        readIo_.hEvent = readEvent_;
+        if (!ReadFile(handle_, rxChunk_.data(), count, nullptr, &readIo_)) {
             const long code = systemError();
-            error = failure(L"직렬 수신 대기 설정 실패", code);
-            return false;
+            if (code != ERROR_IO_PENDING) {
+                error = failure(L"직렬 수신 실패", code);
+                return false;
+            }
+            if (WaitForSingleObject(readEvent_, waitMs + kIoGuardMs) == WAIT_TIMEOUT) CancelIoEx(handle_, &readIo_);
         }
-        std::array<Byte, 4096> chunk{};
-        DWORD got = 0;
-        if (!ReadFile(handle_, chunk.data(), (std::min)(count, static_cast<DWORD>(chunk.size())), &got, nullptr)) {
+        if (!GetOverlappedResult(handle_, &readIo_, &got, TRUE)) {
             const long code = systemError();
+            if (code == ERROR_OPERATION_ABORTED) return true;
             error = failure(L"직렬 수신 실패", code);
             return false;
         }
-        carry_.insert(carry_.end(), chunk.begin(), chunk.begin() + got);
         return true;
+    }
+
+    // 진행 중 송신 결과 수집. wait=false: 미완료 시 다음 호출로 연기
+    // wait=true: 송신 처리 상한 경과 시 자체 취소, 송신 시간 초과로 판정
+    bool finishWrite(bool wait, std::wstring& error)
+    {
+        if (!writePending_) return true;
+        if (wait && WaitForSingleObject(writeEvent_, kSendTimeoutMs + kIoGuardMs) == WAIT_TIMEOUT)
+            CancelIoEx(handle_, &writeIo_);
+        DWORD written = 0;
+        if (!GetOverlappedResult(handle_, &writeIo_, &written, wait ? TRUE : FALSE)) {
+            const long code = systemError();
+            if (!wait && code == ERROR_IO_INCOMPLETE) return true;
+            writePending_ = false;
+            if (code == ERROR_OPERATION_ABORTED) {
+                error = L"직렬 송신 시간 초과 (" + std::to_wstring(written) + L"/" + std::to_wstring(txBuffer_.size()) +
+                        L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
+                return false;
+            }
+            error = failure(L"직렬 송신 실패", code);
+            return false;
+        }
+        writePending_ = false;
+        if (written != txBuffer_.size()) {
+            error = L"직렬 송신 시간 초과 (" + std::to_wstring(written) + L"/" + std::to_wstring(txBuffer_.size()) +
+                    L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
+            return false;
+        }
+        return true;
+    }
+
+    // RS-485 2선식: 송신 진행 중 도착분과 송신 전문 선두 대조. 반이중 선로상 장치 회신 불가 구간
+    // 송신 완료 후 도착분 또는 불일치 바이트 발생 시 해당 전문 대조 종료. 타 전문 지연·중복 회신 잔여분 배제
+    void probeEcho(DWORD got)
+    {
+        if (echoBroken_) return;
+        DWORD written = 0;
+        const bool writing = writePending_ && !GetOverlappedResult(handle_, &writeIo_, &written, FALSE) &&
+                             GetLastError() == ERROR_IO_INCOMPLETE;
+        if (!writing) {
+            echoBroken_ = true;
+            return;
+        }
+        for (DWORD i = 0; i < got; ++i) {
+            if (echoMatched_ >= txBuffer_.size() || rxChunk_[i] != txBuffer_[echoMatched_]) {
+                echoBroken_ = true;
+                return;
+            }
+            ++echoMatched_;
+        }
+        if (echoMatched_ >= kEchoProbeBytes) {
+            sendEcho_ = true;
+            echoBroken_ = true;
+        }
     }
 
     // 수신 대기열 크기 조회. 래치된 회선 오류는 건별 이상으로 기록
@@ -390,10 +441,17 @@ private:
 
     SerialConfig config_;
     HANDLE handle_ = INVALID_HANDLE_VALUE;
+    HANDLE readEvent_ = nullptr;
+    HANDLE writeEvent_ = nullptr;
+    OVERLAPPED readIo_{};
+    OVERLAPPED writeIo_{};
+    bool writePending_ = false;
+    Buffer txBuffer_;                   // 진행 중 송신 전문. 송신 완료까지 유지
+    std::array<Byte, 4096> rxChunk_{};  // 비동기 수신 버퍼
     DWORD readWaitMs_ = MAXDWORD;
-    double charMicros_ = 0.0;  // 직렬 문자 1개 선로 시간(us)
+    std::size_t echoMatched_ = 0;       // 송신 진행 중 송신 전문 선두와 일치한 수신 바이트 수
+    bool echoBroken_ = false;           // 해당 전문 반향 대조 종료
     bool sendEcho_ = false;
-    Buffer carry_;  // 송신 중 대조용 선행 수신분. 다음 receive 선두 전달
     LineFault fault_;
     std::wstring notice_;
 };

@@ -233,8 +233,11 @@ void paintTimeline(HDC dc, const RECT& cell, int base, const std::vector<std::ui
     for (std::size_t k = 0; k < count; ++k) {
         std::uint8_t mark = 0;
         for (std::size_t i = k * slots.size() / count; i < (k + 1) * slots.size() / count; ++i) mark = (std::max)(mark, slots[i]);
-        const int barHeight = mark == 2 ? height : mark == 1 ? height / 2 : (std::max)(1, base / 12);
-        const COLORREF color = mark == 2 ? palette::CellFault : mark == 1 ? palette::CellPass : palette::CellEmpty;
+        // 3 이상: 전고 적색, 2 지연: 3/4 황색, 1 정상: 1/2 녹색, 0 미도래: 기준선
+        const int barHeight = mark >= 3 ? height : mark == 2 ? height * 3 / 4 : mark == 1 ? height / 2
+                                                                                        : (std::max)(1, base / 12);
+        const COLORREF color = mark >= 3 ? palette::CellFault : mark == 2 ? palette::CellLate
+                               : mark == 1 ? palette::CellPass : palette::CellEmpty;
         fill(dc, RECT{left, bottom - barHeight, left + bar, bottom}, color);
         left += bar + gap;
     }

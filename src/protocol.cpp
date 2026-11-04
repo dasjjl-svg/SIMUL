@@ -47,20 +47,19 @@ void appendEscaped(Buffer& out, Byte value)
     }
 }
 
-ParseResult verifyBody(const Byte* body, std::size_t length, Data& dataOut, std::size_t discarded)
+ParseResult verifyBody(const Byte* body, std::size_t length, Frame& frameOut, std::size_t discarded)
 {
     ParseResult result{Parse::Invalid, FrameError::None, discarded};
     if (length != PAYLOAD_SIZE) {
         result.error = FrameError::Length;
-    } else if (body[0] != HEADER_HI || body[1] != HEADER_LO) {
-        result.error = FrameError::Header;
     } else if (body[TRAILER_OFFSET] != TRAILER_HI || body[TRAILER_OFFSET + 1] != TRAILER_LO) {
         result.error = FrameError::Trailer;
     } else if (static_cast<std::uint16_t>((body[CRC_OFFSET] << 8) | body[CRC_OFFSET + 1]) !=
                crc16(body, CRC_OFFSET)) {
         result.error = FrameError::Crc;
     } else {
-        std::copy_n(body + DATA_OFFSET, DATA_SIZE, dataOut.begin());
+        frameOut.sequence = static_cast<std::uint16_t>((body[SEQUENCE_OFFSET] << 8) | body[SEQUENCE_OFFSET + 1]);
+        std::copy_n(body + DATA_OFFSET, DATA_SIZE, frameOut.data.begin());
         result.status = Parse::Ok;
     }
     return result;
@@ -68,12 +67,12 @@ ParseResult verifyBody(const Byte* body, std::size_t length, Data& dataOut, std:
 
 }  // namespace
 
-void buildFrame(const Data& data, Buffer& out)
+void buildFrame(const Frame& frame, Buffer& out)
 {
     std::array<Byte, PAYLOAD_SIZE> body{};
-    body[0] = HEADER_HI;
-    body[1] = HEADER_LO;
-    std::copy(data.begin(), data.end(), body.begin() + DATA_OFFSET);
+    body[SEQUENCE_OFFSET] = static_cast<Byte>(frame.sequence >> 8);
+    body[SEQUENCE_OFFSET + 1] = static_cast<Byte>(frame.sequence & 0xFF);
+    std::copy(frame.data.begin(), frame.data.end(), body.begin() + DATA_OFFSET);
     const std::uint16_t crc = crc16(body.data(), CRC_OFFSET);
     body[CRC_OFFSET] = static_cast<Byte>(crc >> 8);
     body[CRC_OFFSET + 1] = static_cast<Byte>(crc & 0xFF);
@@ -87,7 +86,7 @@ void buildFrame(const Data& data, Buffer& out)
     out.push_back(ETX);
 }
 
-ParseResult parseFrame(Buffer& inOut, Data& dataOut)
+ParseResult parseFrame(Buffer& inOut, Frame& frameOut)
 {
     const auto start = std::find(inOut.begin(), inOut.end(), STX);
     const auto discarded = static_cast<std::size_t>(start - inOut.begin());
@@ -121,7 +120,7 @@ ParseResult parseFrame(Buffer& inOut, Data& dataOut)
             consume(i + 1);
             if (fault == FrameError::None && escaping) fault = FrameError::Escape;
             if (fault != FrameError::None) return invalid(fault);
-            return verifyBody(body.data(), length, dataOut, discarded);
+            return verifyBody(body.data(), length, frameOut, discarded);
         }
         // 최대 길이 초과 전문은 ETX·STX까지 동일 전문으로 소비. 경계 없는 바이트열은 4배 길이에서 절단
         if (i + 1 >= MAX_FRAME_SIZE * 4) {

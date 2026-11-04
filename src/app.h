@@ -59,6 +59,8 @@ private:
         std::size_t failedChannels = 0;
         std::size_t stopped = 0;
         std::uint64_t matched = 0;
+        std::uint64_t late = 0;
+        std::uint64_t waiting = 0;
         std::chrono::milliseconds elapsed{0};
         std::wstring failedList;
         bool hasFailure = false;
