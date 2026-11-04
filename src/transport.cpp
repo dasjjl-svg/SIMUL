@@ -24,7 +24,6 @@ namespace {
 constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스레드 정지 시간 제한
 constexpr DWORD kSendTimeoutMs    = 250;   // 전문 1건 송신 처리 상한. 송신 주기 50ms의 5배
 constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
-constexpr DWORD kByteGapMs        = 2;     // 직렬 수신 반환 조건: 바이트 간 공백 2ms
 constexpr int   kSocketBufferBytes = 262144;  // 소켓 수신 버퍼. 작업 스레드 지연 구간 데이터그램 보존
 constexpr std::size_t kReceiveBurstBytes = 65536;     // receive 1회 수용 상한. 연속 유입 시 송신 주기 처리 기회 보장
 constexpr std::size_t kReceiveBurstDatagrams = 1024;  // UDP receive 1회 수용 데이터그램 상한
@@ -222,7 +221,7 @@ public:
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        // RS-485 2선식: 송신 전후 수신 대기열 비교. 송신 완료 대기형 드라이버(WriteFile 소요 ≥ 전문 선로 시간 절반)에 한해 판정
+        // RS-485 2선식: 송신 전후 수신 대기열 비교로 자기 송신 반향 증거 수집
         const bool halfDuplex = config_.standard == SerialStandard::Rs485TwoWire;
         DWORD before = 0;
         if (halfDuplex && !queuedBytes(before, error)) return false;
@@ -242,9 +241,12 @@ public:
             const auto elapsed = std::chrono::steady_clock::now() - started;
             DWORD after = 0;
             if (!queuedBytes(after, error)) return false;
-            const auto halfWire =
-                std::chrono::duration<double, std::micro>(charMicros_ * static_cast<double>(frame.size()) * 0.5);
-            if (after > before && elapsed >= halfWire) sendEcho_ = true;
+            const auto sampled = std::chrono::steady_clock::now() - started;
+            // 표본 유효 조건: 송신 완료 대기형 쓰기(소요 ≥ 선로 시간 절반) + 전문 선로 시간 내 조회 완료(자기 송신 진행 중)
+            const double wireMicros = charMicros_ * static_cast<double>(frame.size());
+            if (after > before && elapsed >= std::chrono::duration<double, std::micro>(wireMicros * 0.5) &&
+                sampled < std::chrono::duration<double, std::micro>(wireMicros))
+                sendEcho_ = true;
         }
         return true;
     }
@@ -264,6 +266,7 @@ public:
         std::array<Byte, 4096> chunk{};
         const DWORD toRead = queued ? (std::min)(queued, static_cast<DWORD>(chunk.size()))
                                     : static_cast<DWORD>(chunk.size());
+        const auto begun = std::chrono::steady_clock::now();
         DWORD got = 0;
         if (!ReadFile(handle_, chunk.data(), toRead, &got, nullptr)) {
             const long code = systemError();
@@ -271,6 +274,12 @@ public:
             return false;
         }
         inOut.insert(inOut.end(), chunk.begin(), chunk.begin() + got);
+        if (waitMs) {
+            // 대기 중 도착 바이트의 회선 오류 즉시 수집. 시험 종료 직전 최종 회신의 오류 누락 방지
+            if (got && !queuedBytes(queued, error)) return false;
+            // 대기 상한 미준수 드라이버(무수신 즉시 반환)의 공회전 방지
+            if (!got && std::chrono::steady_clock::now() - begun < std::chrono::milliseconds(waitMs) / 2) Sleep(1);
+        }
         return true;
     }
 
@@ -307,13 +316,14 @@ private:
         return true;
     }
 
-    // 수신 대기 방식. 0: 즉시 반환. 그 외: 첫 바이트 도착 후 바이트 간 공백 또는 대기 상한 경과 시 반환
+    // 수신 대기 방식. 0: 즉시 반환. 그 외: 첫 바이트 도착 즉시 또는 대기 상한 경과 시 반환(수신 시각 오차 최소화)
     // 쓰기 상한은 전문 1건 처리 상한 고정. 값 변경 시에만 SetCommTimeouts 호출
     bool applyReadWait(DWORD waitMs)
     {
         if (waitMs == readWaitMs_) return true;
         COMMTIMEOUTS timeouts{};
-        timeouts.ReadIntervalTimeout = waitMs ? kByteGapMs : MAXDWORD;
+        timeouts.ReadIntervalTimeout = MAXDWORD;
+        timeouts.ReadTotalTimeoutMultiplier = waitMs ? MAXDWORD : 0;
         timeouts.ReadTotalTimeoutConstant = waitMs;
         timeouts.WriteTotalTimeoutConstant = kSendTimeoutMs;
         if (!SetCommTimeouts(handle_, &timeouts)) return false;

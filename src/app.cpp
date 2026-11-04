@@ -59,9 +59,9 @@ struct ColumnSpec {
 
 // 열 폭 단위: 대화상자 단위(DLU). 합계 384, 목록 폭 400에서 테두리·세로 스크롤 막대 여유 제외
 constexpr ColumnSpec kColumns[kColumnCount] = {
-    {L"CH", 18, LVCFMT_LEFT},     {L"접속", 42, LVCFMT_LEFT},      {L"대상", 100, LVCFMT_LEFT},
-    {L"판정", 36, LVCFMT_CENTER}, {L"송신", 38, LVCFMT_RIGHT},     {L"정상 회신", 40, LVCFMT_RIGHT},
-    {L"이상", 40, LVCFMT_RIGHT},  {L"최대 지연", 36, LVCFMT_RIGHT}, {L"추이", 34, LVCFMT_LEFT},
+    {L"CH", 18, LVCFMT_LEFT},     {L"접속", 42, LVCFMT_LEFT},      {L"대상", 112, LVCFMT_LEFT},
+    {L"판정", 34, LVCFMT_CENTER}, {L"송신", 38, LVCFMT_RIGHT},     {L"정상 회신", 38, LVCFMT_RIGHT},
+    {L"이상", 38, LVCFMT_RIGHT},  {L"최대 지연", 36, LVCFMT_RIGHT}, {L"추이", 28, LVCFMT_LEFT},
 };
 
 constexpr const wchar_t* kKindNames[] = {L"직렬 (RS-232·422·485)", L"TCP 클라이언트", L"UDP"};
@@ -711,10 +711,13 @@ INT_PTR App::onControlColor(HDC dc, HWND control)
 void App::onPower(WPARAM event)
 {
     if (!running_) return;
+    // 절전 전후 채널 기록을 먼저 반영하여 시각 순서 유지
     if (event == PBT_APMSUSPEND) {
         for (auto& test : tests_)
             if (test) test->interrupt(L"시스템 절전 진입. 절전 구간 송·수신 불가.");
+        appendEvents();
     } else if (event == PBT_APMRESUMEAUTOMATIC) {
+        appendEvents();
         appendLog(L"시스템 절전 복귀.");
     }
 }
@@ -861,7 +864,8 @@ void App::finishTest()
     invalidateVerdict();
     // 판정·추이 열 최종 상태 반영용 목록 무효화
     InvalidateRect(list_, nullptr, FALSE);
-    SetFocus(item(IDC_START_BUTTON));
+    // 결과 확인 중 Enter 1회에 의한 재시작·결과 소멸 방지. 시작 단추 초점 배제
+    SetFocus(list_);
 }
 
 void App::requestClose()
