@@ -15,6 +15,7 @@
 
 #include "format.h"
 #include "resource.h"
+#include "transport.h"
 
 namespace loopback {
 
@@ -26,6 +27,7 @@ constexpr UINT_PTR kCountTimer = 2;
 constexpr UINT kCountDelayMs = 400;  // 채널 수 입력 확정 대기. 중간 입력값의 채널 삭제 방지
 constexpr UINT kRefreshFontsMessage = WM_APP + 1;
 constexpr UINT kComboSyncMessage = WM_APP + 2;
+constexpr UINT kMaximizeMessage = WM_APP + 3;
 constexpr int kLogLimit = 2000000;
 constexpr SIZE_T kResidentBytes = 64 * 1024 * 1024;  // 시험 중 작업 집합 상주 하한
 
@@ -40,6 +42,10 @@ constexpr unsigned long long kMaxBaud = 4000000;
 constexpr unsigned long long kMinReplyWindow = 1;     // 회신 허용 시퀀스 수 범위
 constexpr unsigned long long kMaxReplyWindow = 1000;
 constexpr const wchar_t* kDefaultReplyWindow = L"5";
+constexpr unsigned long long kMinInterval = 10;       // 송신 주기 범위(ms)
+constexpr unsigned long long kMaxInterval = 10000;
+constexpr const wchar_t* kDefaultInterval = L"50";
+constexpr unsigned long long kSteadyInterval = 20;    // 미만 송신 주기는 PC 부하 시 주기 이탈 판정 가능
 constexpr unsigned long long kMaxHours = 72;
 // 평균 전문 길이: 고정 40B + DATA·CRC 34B의 DLE 치환 기대치 0.4B
 constexpr double kMeanFrameBytes = 40.4;
@@ -54,16 +60,43 @@ enum Column {
 
 struct ColumnSpec {
     const wchar_t* title;
-    int width;
+    int width;     // 최소 창 기준 폭(DLU)
+    int grow;      // 목록 확장분 배분 비율
+    bool counter;  // 건수 열: 7자리 천 단위 구분 표기 수용 폭 보장
     int format;
 };
 
-// 열 폭 단위: 대화상자 단위(DLU). 합계 384, 목록 폭 400에서 테두리·세로 스크롤 막대 여유 제외
+// 최소 창 기준 합계 384 DLU: 목록 폭 400에서 테두리·세로 스크롤 막대 여유 제외
 constexpr ColumnSpec kColumns[kColumnCount] = {
-    {L"CH", 18, LVCFMT_LEFT},     {L"접속", 42, LVCFMT_LEFT},      {L"대상", 112, LVCFMT_LEFT},
-    {L"판정", 34, LVCFMT_CENTER}, {L"송신", 38, LVCFMT_RIGHT},     {L"정상 회신", 38, LVCFMT_RIGHT},
-    {L"이상", 38, LVCFMT_RIGHT},  {L"최대 지연", 36, LVCFMT_RIGHT}, {L"추이", 28, LVCFMT_LEFT},
+    {L"CH", 18, 0, false, LVCFMT_LEFT},        {L"접속", 42, 1, false, LVCFMT_LEFT},
+    {L"대상", 100, 3, false, LVCFMT_LEFT},     {L"판정", 34, 1, false, LVCFMT_CENTER},
+    {L"송신", 44, 1, true, LVCFMT_RIGHT},      {L"정상 회신", 44, 1, true, LVCFMT_RIGHT},
+    {L"이상", 42, 1, true, LVCFMT_RIGHT},      {L"최대 지연", 36, 1, false, LVCFMT_RIGHT},
+    {L"추이", 24, 4, false, LVCFMT_LEFT},
 };
+constexpr int kCellPadding = 10;    // 목록 셀 좌우 여백 합(DLU)
+constexpr int kScrollReserve = 12;  // 세로 스크롤 막대 여유(DLU)
+constexpr int kTargetFloor = 72;    // 폭 부족 시 대상 열 축소 하한(DLU)
+
+// 창 확장분 배분 비율(%): 좌·상·우·하 경계별. 표 외 컨트롤은 우측 열 우측 이동, 좌측 열 고정
+struct Anchor {
+    int id;
+    std::uint8_t left;
+    std::uint8_t top;
+    std::uint8_t right;
+    std::uint8_t bottom;
+};
+constexpr std::uint8_t kListShare = 50;  // 세로 확장분 중 채널 목록 몫. 나머지는 시험 기록
+constexpr Anchor kAnchors[] = {
+    {IDC_HEADER, 0, 0, 100, 0},
+    {IDC_VERDICT, 0, 0, 100, 0},
+    {IDC_CHANNEL_SUMMARY, 100, 0, 100, 0},
+    {IDC_CHANNEL_LIST, 0, 0, 100, kListShare},
+    {IDC_CHANNEL_DETAIL, 100, 0, 100, kListShare},
+    {IDC_SECTION_LOG, 0, kListShare, 100, kListShare},
+    {IDC_LOG_TEXT, 0, kListShare, 100, 100},
+};
+constexpr int kRightColumn = 418;  // 우측 열 경계(DLU). 좌측 열 우단 412, 우측 열 좌단 424
 
 constexpr const wchar_t* kKindNames[] = {L"직렬 (RS-232·422·485)", L"TCP 클라이언트", L"UDP"};
 constexpr const wchar_t* kStandardNames[] = {L"RS-232", L"RS-422", L"RS-485 2선식", L"RS-485 4선식"};
@@ -85,14 +118,15 @@ constexpr int kTcpControls[] = {IDC_TCP_HOST_LABEL, IDC_TCP_HOST, IDC_TCP_PORT_L
 constexpr int kUdpControls[] = {IDC_UDP_LOCAL_LABEL, IDC_UDP_LOCAL_HOST, IDC_UDP_LOCAL_PORT_LABEL, IDC_UDP_LOCAL_PORT,
                                 IDC_UDP_REMOTE_LABEL, IDC_UDP_REMOTE_HOST, IDC_UDP_REMOTE_PORT_LABEL,
                                 IDC_UDP_REMOTE_PORT};
-constexpr int kInputControls[] = {IDC_CHANNEL_COUNT, IDC_CHANNEL_COUNT_SPIN, IDC_ECHO_TIMEOUT, IDC_DURATION_HOURS,
+constexpr int kInputControls[] = {IDC_CHANNEL_COUNT, IDC_CHANNEL_COUNT_SPIN, IDC_ECHO_TIMEOUT, IDC_SEND_INTERVAL,
+                                  IDC_DURATION_HOURS,
                                   IDC_DURATION_HOURS_SPIN, IDC_DURATION_MINUTES, IDC_DURATION_MINUTES_SPIN,
                                   IDC_TRANSPORT_COMBO, IDC_SERIAL_STANDARD, IDC_SERIAL_PORT, IDC_SERIAL_REFRESH,
                                   IDC_SERIAL_BAUD, IDC_SERIAL_DATA, IDC_SERIAL_PARITY, IDC_SERIAL_STOP,
                                   IDC_SERIAL_FLOW, IDC_SERIAL_ECHO, IDC_TCP_HOST, IDC_TCP_PORT, IDC_UDP_LOCAL_HOST,
                                   IDC_UDP_LOCAL_PORT, IDC_UDP_REMOTE_HOST, IDC_UDP_REMOTE_PORT};
 constexpr int kMutedLabels[] = {IDC_CHANNEL_SUMMARY, IDC_SERIAL_BAUD_UNIT, IDC_SERIAL_ECHO_HINT,
-                                IDC_DURATION_HOURS_UNIT, IDC_DURATION_MINUTES_UNIT, IDC_ECHO_UNIT};
+                                IDC_DURATION_HOURS_UNIT, IDC_DURATION_MINUTES_UNIT, IDC_ECHO_UNIT, IDC_INTERVAL_UNIT};
 constexpr int kSections[] = {IDC_SECTION_TEST, IDC_SECTION_CHANNELS, IDC_SECTION_EDITOR, IDC_SECTION_LOG};
 
 template <std::size_t N>
@@ -304,6 +338,49 @@ void writeRegistryText(HKEY key, const wchar_t* name, const std::wstring& value)
                    static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
 }
 
+// 기록 시각 표기 "MM-DD hh:mm:ss.mmm" + 구분 공백
+std::wstring stampText(std::chrono::system_clock::time_point when)
+{
+    const std::time_t seconds = std::chrono::system_clock::to_time_t(when);
+    std::tm local{};
+    localtime_s(&local, &seconds);
+    const long long millis = std::chrono::duration_cast<std::chrono::milliseconds>(when.time_since_epoch()).count() % 1000;
+    wchar_t stamp[32]{};
+    std::swprintf(stamp, std::size(stamp), L"%02d-%02d %02d:%02d:%02d.%03lld   ", local.tm_mon + 1, local.tm_mday,
+                  local.tm_hour, local.tm_min, local.tm_sec, millis);
+    return stamp;
+}
+
+// 상위 폴더 포함 생성. 기존 폴더 허용
+bool makeFolder(const std::wstring& path)
+{
+    if (CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) return true;
+    if (GetLastError() != ERROR_PATH_NOT_FOUND) return false;
+    const auto slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash == 0 || !makeFolder(path.substr(0, slash))) return false;
+    return CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+// 시스템 오류 코드 표기 "오류 N: 설명"
+std::wstring errorText(DWORD code)
+{
+    const std::wstring detail = systemText(code);
+    return L"오류 " + std::to_wstring(code) + (detail.empty() ? std::wstring() : L": " + detail);
+}
+
+// UTF-8 변환 후 기록. buffer: 변환 버퍼 재사용
+bool writeUtf8(HANDLE file, const std::wstring& text, std::string& buffer)
+{
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr,
+                                         nullptr);
+    if (size <= 0) return true;
+    buffer.resize(static_cast<std::size_t>(size));
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), buffer.data(), size, nullptr, nullptr);
+    DWORD written = 0;
+    return WriteFile(file, buffer.data(), static_cast<DWORD>(size), &written, nullptr) &&
+           written == static_cast<DWORD>(size);
+}
+
 std::wstring indentContinuation(const std::wstring& text, std::size_t width)
 {
     std::wstring result;
@@ -368,6 +445,7 @@ App::~App()
     for (auto& test : tests_)
         if (test) test->stop();
     releaseSystemHolds();
+    closeLogFile();
     if (surfaceBrush_) DeleteObject(surfaceBrush_);
     if (disabledBrush_) DeleteObject(disabledBrush_);
     for (HICON icon : {bigIcon_, smallIcon_, headerIcon_})
@@ -425,15 +503,47 @@ INT_PTR App::handle(UINT message, WPARAM wParam, LPARAM lParam)
     case WM_CTLCOLORBTN:
         return onControlColor(reinterpret_cast<HDC>(wParam), reinterpret_cast<HWND>(lParam));
     case WM_DPICHANGED:
-        // 대화상자 자동 배율 조정 완료 후 글꼴·열 폭 재산정
+        // 대화상자 자동 배율 조정 완료 후 글꼴·배치·열 폭 재산정
         PostMessageW(dialog_, kRefreshFontsMessage, 0, 0);
         return FALSE;
     case kRefreshFontsMessage:
         refreshFonts();
         refreshIcons();
-        sizeColumns();
+        layout();
         InvalidateRect(dialog_, nullptr, TRUE);
         return TRUE;
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED) layout();
+        return FALSE;
+    case WM_SHOWWINDOW:
+        // 기본 최대화 시작. 대화상자 관리자의 최초 표시(원래 크기) 완료 후 적용
+        if (wParam && !shown_) {
+            shown_ = true;
+            if (maximized_) PostMessageW(dialog_, kMaximizeMessage, 0, 0);
+        }
+        return FALSE;
+    case kMaximizeMessage:
+        // 최소화 시작(바로 가기 실행 옵션)은 유지, 복원 시 최대화
+        if (IsIconic(dialog_)) {
+            WINDOWPLACEMENT placement{};
+            placement.length = sizeof(placement);
+            if (GetWindowPlacement(dialog_, &placement)) {
+                placement.flags |= WPF_RESTORETOMAXIMIZED;
+                SetWindowPlacement(dialog_, &placement);
+            }
+        } else {
+            ShowWindow(dialog_, SW_MAXIMIZE);
+        }
+        return TRUE;
+    case WM_GETMINMAXINFO:
+        // 최소 크기: 대화상자 원형(현재 DPI 환산)
+        if (baseWindow_.cx) {
+            auto& limits = *reinterpret_cast<MINMAXINFO*>(lParam);
+            const int dpi = ui::dpiFor(dialog_);
+            limits.ptMinTrackSize.x = MulDiv(baseWindow_.cx, dpi, baseDpi_);
+            limits.ptMinTrackSize.y = MulDiv(baseWindow_.cy, dpi, baseDpi_);
+        }
+        return FALSE;
     case kComboSyncMessage:
         syncComboText(static_cast<int>(wParam));
         return TRUE;
@@ -482,9 +592,11 @@ void App::onInit()
     SendDlgItemMessageW(dialog_, IDC_DURATION_MINUTES_SPIN, UDM_SETRANGE32, 0, 59);
     SendDlgItemMessageW(dialog_, IDC_DURATION_MINUTES_SPIN, UDM_SETPOS32, 0, 0);
     SetDlgItemTextW(dialog_, IDC_ECHO_TIMEOUT, kDefaultReplyWindow);
+    SetDlgItemTextW(dialog_, IDC_SEND_INTERVAL, kDefaultInterval);
 
     Edit_LimitText(item(IDC_CHANNEL_COUNT), 2);
     Edit_LimitText(item(IDC_ECHO_TIMEOUT), 4);
+    Edit_LimitText(item(IDC_SEND_INTERVAL), 5);
     Edit_LimitText(item(IDC_DURATION_HOURS), 2);
     Edit_LimitText(item(IDC_DURATION_MINUTES), 2);
     ComboBox_LimitText(item(IDC_SERIAL_PORT), 11);
@@ -509,6 +621,7 @@ void App::onInit()
     setInputsEnabled(true);
     previewDuration();
     SetTimer(dialog_, kRefreshTimer, kRefreshMs, nullptr);
+    recordLayout();
     fitToWorkArea();
     SetFocus(item(IDC_START_BUTTON));
 }
@@ -525,6 +638,12 @@ void App::onCommand(int id, int code)
         break;
     case IDC_ECHO_TIMEOUT:
         if (code == EN_CHANGE) conditionsChanged();
+        break;
+    case IDC_SEND_INTERVAL:
+        if (code == EN_CHANGE) {
+            conditionsChanged();
+            InvalidateRect(item(IDC_VERDICT), nullptr, FALSE);
+        }
         break;
     case IDC_DURATION_HOURS:
     case IDC_DURATION_MINUTES:
@@ -753,7 +872,7 @@ void App::startTest()
         return;
     saveSettings();
 
-    // 50ms 송신 주기 정밀도 확보용 1ms 타이머 분해능. 기본 15.6ms 분해능에서는 주기 편차 ±15ms
+    // 송신 주기 정밀도 확보용 1ms 타이머 분해능. 기본 15.6ms 분해능에서는 주기 편차 ±15ms
     timerRaised_ = timeBeginPeriod(1) == TIMERR_NOERROR;
     const HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
 
@@ -809,9 +928,14 @@ void App::startTest()
     ShutdownBlockReasonCreate(dialog_, L"반송 시험 진행 중. 종료 시 시험 중지.");
     setInputsEnabled(false);
 
+    std::wstring logError;
+    logPath_.clear();
+    logFailed_ = false;
+    const bool logged = openLogFile(logError);
     const TestSettings& first = plan.front().settings;
     appendLog(L"시험 시작. 사용 " + std::to_wstring(plan.size()) + L"채널 · 시험 시간 " +
-              clockText(std::chrono::duration_cast<std::chrono::milliseconds>(duration_)) + L" · 회신 허용 시퀀스 " +
+              clockText(std::chrono::duration_cast<std::chrono::milliseconds>(duration_)) + L" · 송신 주기 " +
+              grouped(static_cast<std::uint64_t>(first.interval.count())) + L" ms · 회신 허용 시퀀스 " +
               grouped(first.replyWindow) + L"회 (" +
               grouped(static_cast<std::uint64_t>((first.interval * first.replyWindow).count())) + L" ms)");
     for (const Plan& entry : plan) {
@@ -820,6 +944,8 @@ void App::startTest()
         appendLog(channelName(entry.channel) + L" · " + describe(transport) +
                   (realcom ? L" · Real COM (통신 규격은 NPort 장치 설정 적용)" : L""));
     }
+    appendLog(logged ? L"기록 파일 " + logPath_ + L" (상세 기록 및 송·수신 대조표 포함)"
+                     : L"기록 파일 생성 실패 (" + logError + L"). 화면 기록만 유지.");
     // 작업 스레드 기동은 시작 기록 이후. 채널별 기록의 시각 순서 유지
     for (const Plan& entry : plan) tests_[entry.channel]->begin(entry.channel);
     onTimer();
@@ -869,6 +995,26 @@ void App::finishTest()
     } else {
         appendLog(L"전체 판정 OK. 사용 " + std::to_wstring(result.channels) + L"채널 전 채널 정상 회신.");
     }
+    if (logFile_ != INVALID_HANDLE_VALUE) {
+        // 기록 파일 말미 채널별 결과
+        const auto now = std::chrono::system_clock::now();
+        for (std::size_t i = 0; i < kMaxChannels; ++i) {
+            if (!active_[i]) continue;
+            const TestSnapshot& view = views_[i];
+            COLORREF face{};
+            COLORREF ink{};
+            std::wstring label;
+            rowVerdict(i, face, ink, label);
+            appendLog(channelName(i) + L" · 판정 " + label + L" · 송신 " + grouped(view.sent) + L"건 · 수신 " +
+                          grouped(view.received) + L"건 · 정상 회신 " + grouped(view.matched) + L"건 · 이상 " +
+                          grouped(view.failed) + L"건 · 지연 회신 " + grouped(view.late) + L"건 · 최대 지연 " +
+                          (view.matched ? msText(view.maxLatency) : std::wstring(L"—")) + L" · 평균 지연 " +
+                          (view.matched ? msText(view.meanLatency) : std::wstring(L"—")),
+                      now, {}, false);
+        }
+        if (logFile_ != INVALID_HANDLE_VALUE) appendLog(L"기록 파일 저장. " + logPath_);
+        closeLogFile();
+    }
     refreshRows();
     refreshDetail();
     refreshSummary();
@@ -889,8 +1035,11 @@ void App::requestClose()
         if (MessageBoxW(dialog_, prompt, kAppTitle, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
         finishTest();
     } else if (hasResult_) {
-        if (MessageBoxW(dialog_, L"시험 결과 표시 중. 종료 시 판정·시험 기록 미보존.\n\n프로그램 종료?", kAppTitle,
-                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        const wchar_t* prompt =
+            logPath_.empty() ? L"시험 결과 표시 중. 종료 시 판정·시험 기록 미보존.\n\n프로그램 종료?"
+            : logFailed_     ? L"시험 결과 표시 중. 기록 파일 쓰기 실패로 기록 일부만 보존, 종료 시 화면 판정·기록 소거.\n\n프로그램 종료?"
+                             : L"시험 결과 표시 중. 종료 시 화면 판정·기록 소거 (시험 기록은 기록 파일 보존).\n\n프로그램 종료?";
+        if (MessageBoxW(dialog_, prompt, kAppTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
             return;
     }
     saveSettings();
@@ -944,6 +1093,75 @@ void App::fitToWorkArea()
     top = (std::max)(top, area.top);
     if (left != window.left || top != window.top)
         SetWindowPos(dialog_, nullptr, left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void App::recordLayout()
+{
+    RECT client{};
+    RECT window{};
+    if (!GetClientRect(dialog_, &client) || !GetWindowRect(dialog_, &window)) return;
+    baseClient_ = {client.right, client.bottom};
+    baseWindow_ = {window.right - window.left, window.bottom - window.top};
+    baseDpi_ = ui::dpiFor(dialog_);
+    RECT split{kRightColumn, 0, kRightColumn, 0};
+    MapDialogRect(dialog_, &split);
+    placements_.clear();
+    for (HWND child = GetWindow(dialog_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        Placement place;
+        place.window = child;
+        GetWindowRect(child, &place.rect);
+        MapWindowPoints(nullptr, dialog_, reinterpret_cast<POINT*>(&place.rect), 2);
+        if (place.rect.left >= split.left) place.left = place.right = 100;
+        const int id = GetDlgCtrlID(child);
+        for (const Anchor& anchor : kAnchors) {
+            if (anchor.id != id) continue;
+            place.left = anchor.left;
+            place.top = anchor.top;
+            place.right = anchor.right;
+            place.bottom = anchor.bottom;
+        }
+        placements_.push_back(place);
+    }
+}
+
+// 최소 창 기준 위치(현재 DPI 환산) + 창 확장분 × 배분 비율
+void App::layout()
+{
+    if (!placements_.empty() && !IsIconic(dialog_)) {
+        RECT client{};
+        GetClientRect(dialog_, &client);
+        const int dpi = ui::dpiFor(dialog_);
+        const auto scaled = [dpi, this](LONG value) { return static_cast<LONG>(MulDiv(value, dpi, baseDpi_)); };
+        const LONG dx = (std::max)(0L, client.right - scaled(baseClient_.cx));
+        const LONG dy = (std::max)(0L, client.bottom - scaled(baseClient_.cy));
+        HDWP batch = BeginDeferWindowPos(static_cast<int>(placements_.size()));
+        for (const Placement& place : placements_) {
+            // 확장 대상 외 컨트롤은 위치만 조정. 콤보 상자 목록 높이 등 기존 크기 유지
+            const bool stretch = place.left != place.right || place.top != place.bottom;
+            const LONG left = scaled(place.rect.left) + dx * place.left / 100;
+            const LONG top = scaled(place.rect.top) + dy * place.top / 100;
+            const LONG width = scaled(place.rect.right) + dx * place.right / 100 - left;
+            const LONG height = scaled(place.rect.bottom) + dy * place.bottom / 100 - top;
+            const UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | (stretch ? 0u : static_cast<UINT>(SWP_NOSIZE));
+            if (batch) batch = DeferWindowPos(batch, place.window, nullptr, left, top, width, height, flags);
+            else SetWindowPos(place.window, nullptr, left, top, width, height, flags);
+        }
+        if (batch) EndDeferWindowPos(batch);
+        // 확장 컨트롤 전체 재표시(자체 그리기 영역의 우측 정렬 요소 잔상 방지)
+        for (const Placement& place : placements_)
+            if (place.left != place.right || place.top != place.bottom) InvalidateRect(place.window, nullptr, TRUE);
+        InvalidateRect(dialog_, nullptr, TRUE);
+    }
+    sizeColumns();
+}
+
+bool App::windowMaximized() const
+{
+    WINDOWPLACEMENT placement{};
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(dialog_, &placement)) return maximized_;
+    return placement.showCmd == SW_SHOWMAXIMIZED ||
+           (placement.showCmd == SW_SHOWMINIMIZED && (placement.flags & WPF_RESTORETOMAXIMIZED));
 }
 
 bool App::readChannel(std::size_t index, TransportConfig& config, std::wstring& error, int& field) const
@@ -1046,6 +1264,7 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
     unsigned long long hours = 0;
     unsigned long long minutes = 0;
     unsigned long long window = 0;
+    unsigned long long interval = 0;
     if (!parseNumber(trimmed(text(IDC_CHANNEL_COUNT)), kMaxChannels, count) || count != channelCount_) {
         error = L"채널 수 범위 오류. 1~32 지정.";
         field = IDC_CHANNEL_COUNT;
@@ -1072,6 +1291,11 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
         field = IDC_ECHO_TIMEOUT;
         return false;
     }
+    if (!parseNumber(trimmed(text(IDC_SEND_INTERVAL)), kMaxInterval, interval) || interval < kMinInterval) {
+        error = L"송신 주기 범위 오류. 10~10,000 ms 지정.";
+        field = IDC_SEND_INTERVAL;
+        return false;
+    }
 
     plan.clear();
     for (std::size_t i = 0; i < channelCount_; ++i) {
@@ -1082,7 +1306,7 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
             return false;
         }
         entry.settings.duration = std::chrono::seconds(static_cast<long long>(seconds));
-        entry.settings.interval = std::chrono::milliseconds(50);
+        entry.settings.interval = std::chrono::milliseconds(static_cast<long long>(interval));
         entry.settings.replyWindow = static_cast<std::uint32_t>(window);
         plan.push_back(entry);
     }
@@ -1136,18 +1360,25 @@ std::wstring App::planWarnings(const std::vector<Plan>& plan) const
         if (serial.standard == SerialStandard::Rs485TwoWire && serial.localEcho == LocalEcho::Absent)
             add(entry.channel, L"RS-485 2선식 송신 반향 미발생 설정. USB·네트워크 변환기는 송신 반향 오설정 자동 검출 불가, "
                                L"송신 반향 발생 시 장치 무회신도 정상 판정.");
-        // 소요 속도: 평균 전문 × 문자당 비트 ÷ 50ms. RS-485 2선식은 송신·회신이 한 선로 공유
+        // 소요 속도: 평균 전문 × 문자당 비트 ÷ 송신 주기. RS-485 2선식은 송신·회신이 한 선로 공유
         const double stop = serial.stopBits == ONESTOPBIT ? 1.0 : serial.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
         const double bits = 1.0 + serial.dataBits + (serial.parity != NOPARITY ? 1.0 : 0.0) + stop;
         const bool shared = serial.standard == SerialStandard::Rs485TwoWire;
+        const double period = std::chrono::duration<double>(entry.settings.interval).count();
         const auto required =
-            static_cast<unsigned long long>(kMeanFrameBytes * bits / 0.05 * (shared ? 2.0 : 1.0)) + 1;
+            static_cast<unsigned long long>(kMeanFrameBytes * bits / period * (shared ? 2.0 : 1.0)) + 1;
         if (serial.baud < required)
-            add(entry.channel, L"통신 속도 " + grouped(serial.baud) + L" bps. 50 ms 주기 유지 소요 " +
+            add(entry.channel, L"통신 속도 " + grouped(serial.baud) + L" bps. " +
+                                   grouped(static_cast<std::uint64_t>(entry.settings.interval.count())) +
+                                   L" ms 주기 유지 소요 " +
                                    grouped(required) + L" bps 미달" + (shared ? L" (반이중 송·회신 공유)" : L"") +
                                    L", 판정 FAIL 예상.");
     }
     std::wstring warnings;
+    const auto interval = plan.empty() ? 0ULL : static_cast<unsigned long long>(plan.front().settings.interval.count());
+    if (interval && interval < kSteadyInterval)
+        warnings = L"송신 주기 " + grouped(interval) + L" ms. " + std::to_wstring(kSteadyInterval) +
+                   L" ms 미만은 PC 부하 시 송신 주기 이탈(이상) 판정 가능.\n";
     for (const auto& group : groups) warnings += channelRanges(group.second) + L": " + group.first + L"\n";
     return warnings;
 }
@@ -1171,6 +1402,10 @@ void App::loadSettings()
     if (readRegistryText(key, L"ReplyWindow", value) && parseNumber(value, kMaxReplyWindow, number) &&
         number >= kMinReplyWindow)
         SetDlgItemTextW(dialog_, IDC_ECHO_TIMEOUT, value.c_str());
+    if (readRegistryText(key, L"SendInterval", value) && parseNumber(value, kMaxInterval, number) &&
+        number >= kMinInterval)
+        SetDlgItemTextW(dialog_, IDC_SEND_INTERVAL, value.c_str());
+    if (readRegistryText(key, L"Maximized", value)) maximized_ = value != L"0";
     RegCloseKey(key);
 }
 
@@ -1184,6 +1419,8 @@ void App::saveSettings() const
     writeRegistryText(key, L"DurationHours", trimmed(text(IDC_DURATION_HOURS)));
     writeRegistryText(key, L"DurationMinutes", trimmed(text(IDC_DURATION_MINUTES)));
     writeRegistryText(key, L"ReplyWindow", trimmed(text(IDC_ECHO_TIMEOUT)));
+    writeRegistryText(key, L"SendInterval", trimmed(text(IDC_SEND_INTERVAL)));
+    writeRegistryText(key, L"Maximized", windowMaximized() ? L"1" : L"0");
     RegCloseKey(key);
 }
 
@@ -1247,10 +1484,41 @@ void App::clearResults()
     if (list_) InvalidateRect(list_, nullptr, FALSE);
 }
 
+// 최소 창 기준 폭 보장. 목록 확장분은 열별 배분 비율로 추가, 폭 부족분은 대상 열에서 차감
+// 건수 열은 7자리 천 단위 구분 표기("8,888,888") 수용 폭 이상
 void App::sizeColumns()
 {
-    for (int column = 0; column < kColumnCount; ++column)
-        ListView_SetColumnWidth(list_, column, dluToPixels(kColumns[column].width));
+    if (!list_) return;
+    const int counter = ListView_GetStringWidth(list_, L"8,888,888") + dluToPixels(kCellPadding);
+    std::array<int, kColumnCount> widths{};
+    int total = 0;
+    int weights = 0;
+    for (std::size_t column = 0; column < widths.size(); ++column) {
+        const ColumnSpec& spec = kColumns[column];
+        widths[column] = spec.counter ? (std::max)(dluToPixels(spec.width), counter) : dluToPixels(spec.width);
+        total += widths[column];
+        weights += spec.grow;
+    }
+    RECT client{};
+    GetClientRect(list_, &client);
+    // 세로 스크롤 막대 미표시 상태도 막대 폭 확보: 행 증가 시 가로 스크롤 막대 발생 방지
+    const bool scrolling = (GetWindowLongPtrW(list_, GWL_STYLE) & WS_VSCROLL) != 0;
+    const int spare = static_cast<int>(client.right) - (scrolling ? 0 : dluToPixels(kScrollReserve)) - total;
+    if (spare < 0) {
+        int& target = widths[kColTarget];
+        target = (std::max)(dluToPixels(kTargetFloor), target + spare);
+    } else if (weights) {
+        int given = 0;
+        int cumulative = 0;
+        for (std::size_t column = 0; column < widths.size(); ++column) {
+            cumulative += kColumns[column].grow;
+            const int share = spare * cumulative / weights - given;
+            widths[column] += share;
+            given += share;
+        }
+    }
+    for (std::size_t column = 0; column < widths.size(); ++column)
+        ListView_SetColumnWidth(list_, static_cast<int>(column), widths[column]);
 }
 
 void App::focusChannel(std::size_t index, int field)
@@ -1542,16 +1810,15 @@ std::wstring App::text(int id) const
     return value;
 }
 
-void App::appendLog(const std::wstring& line, std::chrono::system_clock::time_point when)
+void App::appendLog(const std::wstring& line, std::chrono::system_clock::time_point when,
+                    const std::wstring& appendix, bool screen)
 {
-    const std::time_t seconds = std::chrono::system_clock::to_time_t(when);
-    std::tm local{};
-    localtime_s(&local, &seconds);
-    const long long millis = std::chrono::duration_cast<std::chrono::milliseconds>(when.time_since_epoch()).count() % 1000;
-    wchar_t stamp[32]{};
-    std::swprintf(stamp, std::size(stamp), L"%02d-%02d %02d:%02d:%02d.%03lld   ", local.tm_mon + 1, local.tm_mday,
-                  local.tm_hour, local.tm_min, local.tm_sec, millis);
-    const std::wstring entry = stamp + indentContinuation(line, std::wcslen(stamp) + 4) + L"\r\n";
+    const std::wstring stamp = stampText(when);
+    const std::size_t indent = stamp.size() + 4;
+    if (logFile_ != INVALID_HANDLE_VALUE)
+        writeLogFile(stamp + indentContinuation(appendix.empty() ? line : line + L"\r\n" + appendix, indent) + L"\r\n");
+    if (!screen) return;
+    const std::wstring entry = stamp + indentContinuation(line, indent) + L"\r\n";
 
     const HWND log = item(IDC_LOG_TEXT);
     int length = GetWindowTextLengthW(log);
@@ -1576,7 +1843,85 @@ void App::appendEvents()
     }
     std::stable_sort(batch.begin(), batch.end(),
                      [](const auto& a, const auto& b) { return a.second.wall < b.second.wall; });
-    for (const auto& entry : batch) appendLog(channelName(entry.first) + L" · " + entry.second.text, entry.second.wall);
+    for (const auto& entry : batch)
+        appendLog(channelName(entry.first) + L" · " + entry.second.text, entry.second.wall, entry.second.evidence,
+                  !entry.second.fileOnly);
+}
+
+bool App::openLogFile(std::wstring& error)
+{
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t name[48]{};
+    std::swprintf(name, std::size(name), L"LoopbackTester_%04u%02u%02u_%02u%02u%02u", static_cast<unsigned>(now.wYear),
+                  static_cast<unsigned>(now.wMonth), static_cast<unsigned>(now.wDay), static_cast<unsigned>(now.wHour),
+                  static_cast<unsigned>(now.wMinute), static_cast<unsigned>(now.wSecond));
+    std::vector<std::wstring> folders;
+    std::wstring module(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+    if (length && length < module.size()) {
+        module.resize(length);
+        const auto slash = module.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) folders.push_back(module.substr(0, slash) + L"\\logs");
+    }
+    std::wstring local(32768, L'\0');
+    const DWORD size = GetEnvironmentVariableW(L"LOCALAPPDATA", local.data(), static_cast<DWORD>(local.size()));
+    if (size && size < local.size()) folders.push_back(local.substr(0, size) + L"\\LoopbackTester\\logs");
+
+    DWORD code = ERROR_PATH_NOT_FOUND;
+    for (const std::wstring& folder : folders) {
+        if (!makeFolder(folder)) {
+            code = GetLastError();
+            continue;
+        }
+        // 동일 초 재시작 대비 일련번호 부가
+        for (int copy = 1; copy < 100; ++copy) {
+            const std::wstring path =
+                folder + L"\\" + name + (copy > 1 ? L"_" + std::to_wstring(copy) : std::wstring()) + L".log";
+            const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                            FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file == INVALID_HANDLE_VALUE) {
+                code = GetLastError();
+                if (code == ERROR_FILE_EXISTS) continue;
+                break;
+            }
+            // 머리 행 기록으로 쓰기 가능 확인(용량 부족 매체 대비). 실패 시 빈 파일 삭제 후 다음 폴더
+            // UTF-8 BOM: 메모장 등 문자 집합 자동 판별
+            wchar_t opened[64]{};
+            std::swprintf(opened, std::size(opened), L"%04u-%02u-%02u %02u:%02u:%02u", static_cast<unsigned>(now.wYear),
+                          static_cast<unsigned>(now.wMonth), static_cast<unsigned>(now.wDay),
+                          static_cast<unsigned>(now.wHour), static_cast<unsigned>(now.wMinute),
+                          static_cast<unsigned>(now.wSecond));
+            if (writeUtf8(file, L"\xFEFF" + std::wstring(kAppTitle) + L" v1.0 시험 기록 (" + opened + L" 시작)\r\n\r\n",
+                          logBytes_)) {
+                logFile_ = file;
+                logPath_ = path;
+                return true;
+            }
+            code = GetLastError();
+            CloseHandle(file);
+            DeleteFileW(path.c_str());
+            break;
+        }
+    }
+    error = errorText(code);
+    return false;
+}
+
+void App::writeLogFile(const std::wstring& text)
+{
+    if (logFile_ == INVALID_HANDLE_VALUE || text.empty() || writeUtf8(logFile_, text, logBytes_)) return;
+    const DWORD code = GetLastError();
+    closeLogFile();
+    logFailed_ = true;
+    appendLog(L"기록 파일 쓰기 실패 (" + errorText(code) + L"). 이후 화면 기록만 유지.");
+}
+
+void App::closeLogFile()
+{
+    if (logFile_ == INVALID_HANDLE_VALUE) return;
+    CloseHandle(logFile_);
+    logFile_ = INVALID_HANDLE_VALUE;
 }
 
 void App::refreshIcons()
@@ -1709,7 +2054,11 @@ ui::VerdictView App::verdictView() const
     if (!started) {
         view.color = ui::palette::Idle;
         view.state = L"대기";
-        view.detail = L"사용 " + std::to_wstring(channelCount_) + L"채널 · 송신 주기 50 ms · DATA 32 Byte";
+        unsigned long long interval = 0;
+        const bool valid = parseNumber(trimmed(text(IDC_SEND_INTERVAL)), kMaxInterval, interval) && interval >= kMinInterval;
+        view.detail = L"사용 " + std::to_wstring(channelCount_) + L"채널 · 송신 주기 " +
+                      (valid ? grouped(interval) + L" ms" : std::wstring(L"확인 필요")) +
+                      L" · DATA 32 Byte · 시험 시간 최대 72시간";
     } else if (result.failedChannels) {
         view.color = ui::palette::Fault;
         view.state = L"FAIL";

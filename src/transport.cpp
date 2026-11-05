@@ -22,7 +22,6 @@ namespace loopback {
 namespace {
 
 constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스레드 정지 시간 제한
-constexpr DWORD kSendTimeoutMs    = 250;   // 전문 1건 송신 처리 상한. 송신 주기 50ms의 5배
 constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
 constexpr DWORD kIoGuardMs = 20;         // 대기 상한(COMMTIMEOUTS) 미준수 드라이버 대비 자체 대기 여유. 준수 드라이버 자체 만료 우선
 constexpr Byte kUnfilled = 0x5A;         // 수신 버퍼 미기록 판별 표지
@@ -43,6 +42,8 @@ int ensureWinsock()
     return boot.status;
 }
 
+}  // namespace
+
 std::wstring systemText(DWORD code)
 {
     wchar_t* buffer = nullptr;
@@ -56,6 +57,8 @@ std::wstring systemText(DWORD code)
         text.pop_back();
     return text;
 }
+
+namespace {
 
 // code는 문자열 조립 전 GetLastError·WSAGetLastError 즉시 획득값 전제
 std::wstring failure(const std::wstring& what, long code)
@@ -134,7 +137,7 @@ void enlargeReceiveBuffer(SOCKET socket)
 
 class SerialTransport : public Transport {
 public:
-    explicit SerialTransport(const SerialConfig& config) : config_(config)
+    SerialTransport(const SerialConfig& config, DWORD sendTimeoutMs) : config_(config), sendTimeoutMs_(sendTimeoutMs)
     {
         const double stop = config.stopBits == ONESTOPBIT ? 1.0 : config.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
         const double bits = 1.0 + config.dataBits + (config.parity != NOPARITY ? 1.0 : 0.0) + stop;
@@ -358,7 +361,7 @@ private:
     bool finishWrite(std::wstring& error)
     {
         if (!writePending_) return true;
-        const bool cancelled = WaitForSingleObject(writeEvent_, kSendTimeoutMs + kIoGuardMs) == WAIT_TIMEOUT &&
+        const bool cancelled = WaitForSingleObject(writeEvent_, sendTimeoutMs_ + kIoGuardMs) == WAIT_TIMEOUT &&
                                CancelIoEx(handle_, &writeIo_);
         DWORD written = 0;
         if (!GetOverlappedResult(handle_, &writeIo_, &written, TRUE)) {
@@ -366,7 +369,7 @@ private:
             writePending_ = false;
             if (cancelled && code == ERROR_OPERATION_ABORTED) {
                 error = L"직렬 송신 시간 초과 (" + std::to_wstring(written) + L"/" + std::to_wstring(txBuffer_.size()) +
-                        L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
+                        L" Byte, " + std::to_wstring(sendTimeoutMs_) + L" ms)";
                 return false;
             }
             error = failure(L"직렬 송신 실패", code);
@@ -375,7 +378,7 @@ private:
         writePending_ = false;
         if (written != txBuffer_.size()) {
             error = L"직렬 송신 시간 초과 (" + std::to_wstring(written) + L"/" + std::to_wstring(txBuffer_.size()) +
-                    L" Byte, " + std::to_wstring(kSendTimeoutMs) + L" ms)";
+                    L" Byte, " + std::to_wstring(sendTimeoutMs_) + L" ms)";
             return false;
         }
         return true;
@@ -434,7 +437,7 @@ private:
         timeouts.ReadIntervalTimeout = MAXDWORD;
         timeouts.ReadTotalTimeoutMultiplier = waitMs ? MAXDWORD : 0;
         timeouts.ReadTotalTimeoutConstant = waitMs;
-        timeouts.WriteTotalTimeoutConstant = kSendTimeoutMs;
+        timeouts.WriteTotalTimeoutConstant = sendTimeoutMs_;
         if (!SetCommTimeouts(handle_, &timeouts)) return false;
         readWaitMs_ = waitMs;
         return true;
@@ -464,6 +467,7 @@ private:
     }
 
     SerialConfig config_;
+    DWORD sendTimeoutMs_;
     HANDLE handle_ = INVALID_HANDLE_VALUE;
     HANDLE readEvent_ = nullptr;
     HANDLE writeEvent_ = nullptr;
@@ -484,7 +488,7 @@ private:
 
 class TcpTransport : public Transport {
 public:
-    explicit TcpTransport(const TcpConfig& config) : config_(config) {}
+    TcpTransport(const TcpConfig& config, DWORD sendTimeoutMs) : config_(config), sendTimeoutMs_(sendTimeoutMs) {}
     ~TcpTransport() override { close(); }
 
     bool open(std::wstring& error) override
@@ -509,7 +513,7 @@ public:
         }
         enlargeReceiveBuffer(socket_);
         u_long nonblocking = 1;
-        BOOL noDelay = TRUE;  // 50ms 주기 소형 전문의 Nagle 지연 방지
+        BOOL noDelay = TRUE;  // 소형 전문 주기 송신의 Nagle 지연 방지
         if (ioctlsocket(socket_, FIONBIO, &nonblocking) != 0 ||
             setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay)) != 0) {
             const long code = socketError();
@@ -539,7 +543,7 @@ public:
 
     bool send(const Buffer& frame, std::wstring& error) override
     {
-        const ULONGLONG deadline = GetTickCount64() + kSendTimeoutMs;
+        const ULONGLONG deadline = GetTickCount64() + sendTimeoutMs_;
         std::size_t offset = 0;
         while (offset < frame.size()) {
             const int sent = ::send(socket_, reinterpret_cast<const char*>(frame.data() + offset),
@@ -555,7 +559,7 @@ public:
             }
             const ULONGLONG now = GetTickCount64();
             if (now >= deadline) {
-                error = L"TCP 송신 시간 초과 (" + std::to_wstring(kSendTimeoutMs) + L" ms). 상대 수신 정체.";
+                error = L"TCP 송신 시간 초과 (" + std::to_wstring(sendTimeoutMs_) + L" ms). 상대 수신 정체.";
                 return false;
             }
             fd_set writable;
@@ -645,6 +649,7 @@ private:
     }
 
     TcpConfig config_;
+    DWORD sendTimeoutMs_;
     SOCKET socket_ = INVALID_SOCKET;
 };
 
@@ -793,8 +798,8 @@ private:
 std::unique_ptr<Transport> makeTransport(const TransportConfig& config)
 {
     switch (config.kind) {
-    case TransportKind::Serial: return std::make_unique<SerialTransport>(config.serial);
-    case TransportKind::Tcp:    return std::make_unique<TcpTransport>(config.tcp);
+    case TransportKind::Serial: return std::make_unique<SerialTransport>(config.serial, config.sendTimeoutMs);
+    case TransportKind::Tcp:    return std::make_unique<TcpTransport>(config.tcp, config.sendTimeoutMs);
     case TransportKind::Udp:    return std::make_unique<UdpTransport>(config.udp);
     }
     return {};

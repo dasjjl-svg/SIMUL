@@ -86,6 +86,10 @@ private:
     void conditionsChanged();
     void syncComboText(int id);
     void fitToWorkArea();
+    // 최소 창(대화상자 원형) 배치 기록. 창 확장분은 컨트롤별 배분 비율로 배치
+    void recordLayout();
+    void layout();
+    bool windowMaximized() const;
 
     bool readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, int& field) const;
     bool readChannel(std::size_t index, TransportConfig& config, std::wstring& error, int& field) const;
@@ -114,9 +118,15 @@ private:
 
     void previewDuration();
     void setInputsEnabled(bool enabled);
+    // appendix: 기록 파일 전용 후속 행. screen: 화면 기록 여부
     void appendLog(const std::wstring& line,
-                   std::chrono::system_clock::time_point when = std::chrono::system_clock::now());
+                   std::chrono::system_clock::time_point when = std::chrono::system_clock::now(),
+                   const std::wstring& appendix = {}, bool screen = true);
     void appendEvents();
+    // 시험 기록 파일(UTF-8): 실행 파일 폴더 logs, 쓰기 불가 시 %LOCALAPPDATA%\LoopbackTester\logs
+    bool openLogFile(std::wstring& error);
+    void writeLogFile(const std::wstring& text);
+    void closeLogFile();
     void updateTitle();
     void refreshFonts();
     // 창·작업 표시줄 아이콘과 상단 로고를 현재 DPI 크기로 재적재
@@ -155,6 +165,27 @@ private:
     std::size_t channelCount_ = 1;
     std::size_t selected_ = 0;
     bool loading_ = false;
+
+    HANDLE logFile_ = INVALID_HANDLE_VALUE;
+    std::wstring logPath_;   // 최근 시험 기록 파일 경로. 생성 실패 시 빈 값
+    bool logFailed_ = false; // 시험 중 기록 파일 쓰기 실패(기록 일부만 보존)
+    std::string logBytes_;   // UTF-8 변환 버퍼
+
+    // 창 크기 변경 배치: 컨트롤별 최소 창 기준 위치와 확장분 배분 비율(%)
+    struct Placement {
+        HWND window = nullptr;
+        RECT rect{};
+        std::uint8_t left = 0;
+        std::uint8_t top = 0;
+        std::uint8_t right = 0;
+        std::uint8_t bottom = 0;
+    };
+    std::vector<Placement> placements_;
+    SIZE baseClient_{};
+    SIZE baseWindow_{};
+    int baseDpi_ = 96;
+    bool maximized_ = true;  // 최대화 상태 시작. 직전 종료 상태 유지
+    bool shown_ = false;     // 최초 표시 완료
 
     std::chrono::seconds duration_{3600};
     bool running_ = false;

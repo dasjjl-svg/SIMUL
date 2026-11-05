@@ -1,15 +1,26 @@
 #include "loopback_test.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cwchar>
 #include <iterator>
 
 #include "format.h"
+#include "frame_diff.h"
 #include "scheduling.h"
 
 namespace loopback {
 
 namespace {
+
+constexpr std::size_t kCompareBytes = MAX_FRAME_SIZE * 2;  // 대조 대상 수신 바이트 상한
+constexpr std::uint64_t kCompareMargin = 64;   // 대응 후보: 최근 송신 전문(회신 허용 시퀀스 + 64건)
+constexpr std::uint64_t kCompareSpan = 1024;   // 대응 후보 최근 송신 전문 상한
+constexpr std::size_t kFinalists = 4;          // 정렬 대조 대상 상위 후보 수
+constexpr std::size_t kMinAnchored = 4;        // 대응 인정 하한: 연속 일치 구간 내 DATA·CRC 바이트 수
+constexpr std::size_t kNoiseCompareMin = 8;    // 전문 외 수신의 송신 전문 대조 하한 길이
+constexpr std::size_t kSummaryItems = 3;       // 상이 요약 항목 상한
+constexpr std::size_t kEvidenceItems = 64;     // 대조표 상이 항목 상한
 
 const wchar_t* describe(FrameError error)
 {
@@ -67,7 +78,11 @@ bool LoopbackTest::open(const TestSettings& settings, std::wstring& error)
     drainGrace_ = Clock::duration(std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(
                       serialKind ? charMicros_ * static_cast<double>(MAX_FRAME_SIZE) : 0.0))) +
                   settleWait_;
-    transport_ = makeTransport(settings.transport);
+    // 전문 1건 송신 처리 상한: 최대 전문 2건 선로 시간(저속 직렬 대응) + 100ms, 최소 250ms
+    TransportConfig transport = settings.transport;
+    transport.sendTimeoutMs = static_cast<DWORD>((std::max)(
+        250.0, std::ceil(2.0 * static_cast<double>(MAX_FRAME_SIZE) * charMicros_ / 1000.0) + 100.0));
+    transport_ = makeTransport(transport);
     if (!transport_) { error = L"접속 방식 미지원."; return false; }
     if (!transport_->open(error)) { transport_.reset(); return false; }
     return true;
@@ -90,6 +105,9 @@ void LoopbackTest::begin(std::size_t lane)
         latencySumUs_ = 0;
         loggedFailures_ = 0;
         loggedLate_ = 0;
+        filedFailures_ = 0;
+        filedLate_ = 0;
+        evidenceLogged_ = 0;
         summarizing_ = false;
         summarizedFailures_ = 0;
         summarizedLate_ = 0;
@@ -100,6 +118,12 @@ void LoopbackTest::begin(std::size_t lane)
         noiseBytes_ = 0;
         const std::wstring notice = transport_->notice();
         if (!notice.empty()) note(notice);
+        frameBytes_.clear();
+        frameBytes_.reserve(MAX_FRAME_SIZE * 4);
+        noiseSample_.clear();
+        noiseSample_.reserve(kCompareBytes);
+        compareSent_.reserve(MAX_FRAME_SIZE);
+        compareGot_.reserve(kCompareBytes);
     }
     rxBuffer_.clear();
     rxBuffer_.reserve(65536);
@@ -280,7 +304,7 @@ void LoopbackTest::run()
             // 치명 오류 시에도 동일 호출에서 수신 완료된 전문은 판정 반영
             for (;;) {
                 Frame got;
-                const ParseResult parsed = parseFrame(rxBuffer_, got);
+                const ParseResult parsed = parseFrame(rxBuffer_, got, &frameBytes_, &noiseSample_);
                 handleFrame(parsed, got, at);
                 if (parsed.status == Parse::NeedMore) break;
             }
@@ -309,7 +333,7 @@ void LoopbackTest::collectReceived()
              fault.count);
     for (;;) {
         Frame got;
-        const ParseResult parsed = parseFrame(rxBuffer_, got);
+        const ParseResult parsed = parseFrame(rxBuffer_, got, &frameBytes_, &noiseSample_);
         handleFrame(parsed, got, at);
         if (parsed.status == Parse::NeedMore) break;
     }
@@ -346,7 +370,7 @@ void LoopbackTest::finish(const std::wstring& abortReason)
         for (std::uint64_t n = expireCursor_; n <= state_.sent; ++n) {
             const Slot& slot = slotOf(n);
             if (slot.number == n && !slot.answered && !slot.lost)
-                fail(n, L"미회신 (시험 종료 시점)" + echoHint(slot), end, false);
+                fail(n, L"미회신 (시험 종료 시점)" + missHint(slot), end, false);
         }
         if (!aborted) note(L"시험 종료 시점 미회신 " + grouped(unresolved) + L"건.");
     }
@@ -393,23 +417,34 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Frame& got, Cloc
 
     if (parsed.status == Parse::Invalid) {
         ++state_.received;
-        fail(0, std::wstring(L"전문 불량: ") + describe(parsed.error), at);
+        // 손상 전문의 시퀀스 해석값(본문 2B 이상 복원 시)은 대응 후보로만 사용
+        std::uint64_t hint = 0;
+        if (parsed.bodyLength >= DATA_OFFSET)
+            hint = slots_[static_cast<std::uint16_t>((parsed.body[SEQUENCE_OFFSET] << 8) |
+                                                     parsed.body[SEQUENCE_OFFSET + 1])].number;
+        Comparison match = compare(frameBytes_, frameBytes_.size(), hint, false, at);
+        markDamaged(match.number);
+        fail(match.number,
+             std::wstring(L"전문 불량: ") + describe(parsed.error) + L". " +
+                 (match.number ? match.summary : L"대응 송신 전문 특정 불가 (수신 " + grouped(frameBytes_.size()) + L" Byte)"),
+             at, true, 1, std::move(match.evidence));
         return;
     }
 
     Slot& slot = slots_[got.sequence];
-    if (!slot.number) {
+    if (!slot.number || slot.data != got.data) {
         ++state_.received;
-        fail(0, L"송신 대응 없는 전문 수신 (시퀀스 " + sequenceText(got.sequence) + L")", at);
-        return;
-    }
-    if (slot.data != got.data) {
-        ++state_.received;
-        std::size_t differing = 0;
-        for (std::size_t i = 0; i < DATA_SIZE; ++i) differing += slot.data[i] != got.data[i] ? 1u : 0u;
-        fail(slot.number, L"DATA 불일치 (시퀀스 " + sequenceText(got.sequence) + L", " + std::to_wstring(differing) +
-                              L" Byte 상이)\r\n송신 " + hexText(slot.data.data(), DATA_SIZE) +
-                              L"\r\n수신 " + hexText(got.data.data(), DATA_SIZE), at);
+        Comparison match = compare(frameBytes_, frameBytes_.size(), slot.number, true, at);
+        markDamaged(match.number);
+        std::wstring text;
+        if (match.number && match.number != slot.number)
+            text = L"시퀀스 불일치 (수신 " + sequenceText(got.sequence) + L", 대응 송신 " +
+                   sequenceText(static_cast<std::uint16_t>(match.number - 1)) + L")";
+        else if (slot.number)
+            text = L"DATA 불일치 (시퀀스 " + sequenceText(got.sequence) + L")";
+        else
+            text = L"송신 대응 없는 전문 수신 (시퀀스 " + sequenceText(got.sequence) + L")";
+        fail(match.number, match.number ? text + L". " + match.summary : text, at, true, 1, std::move(match.evidence));
         return;
     }
     if (slot.answered) {
@@ -456,8 +491,125 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Frame& got, Cloc
 void LoopbackTest::flushNoise()
 {
     if (!noiseBytes_) return;
-    fail(0, L"전문 외 수신 " + grouped(noiseBytes_) + L" Byte", noiseAt_);
+    std::wstring text = L"전문 외 수신 " + grouped(noiseBytes_) + L" Byte";
+    // 송신 전문 길이 수준 잡음은 STX 손상 전문 여부 대조
+    Comparison match;
+    if (noiseSample_.size() >= kNoiseCompareMin) {
+        match = compare(noiseSample_, noiseBytes_, 0, false, noiseAt_);
+    } else {
+        match.evidence = L"수신 원문 " + grouped(noiseBytes_) + L" Byte\r\n" + byteRows(noiseSample_, L"수신");
+    }
+    markDamaged(match.number);
+    if (match.number) text += L". " + match.summary;
+    fail(match.number, text, noiseAt_, true, 1, std::move(match.evidence));
     noiseBytes_ = 0;
+    noiseSample_.clear();
+}
+
+LoopbackTest::Comparison LoopbackTest::compare(const Buffer& received, std::uint64_t total, std::uint64_t hint,
+                                               bool trustHint, Clock::time_point at)
+{
+    const std::size_t used = (std::min)(received.size(), kCompareBytes);
+    compareGot_.assign(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(used));
+    const std::wstring sizes = grouped(total) + L" Byte" + (used < total ? L" 중 앞 " + grouped(used) + L" Byte" : std::wstring());
+    const std::uint64_t sent = state_.sent;
+    const std::uint64_t span = (std::min)(sent, (std::min)(settings_.replyWindow + kCompareMargin, kCompareSpan));
+    const auto rebuild = [this](std::uint64_t number) {
+        buildFrame(Frame{static_cast<std::uint16_t>(number - 1), slotOf(number).data}, compareSent_);
+    };
+
+    // 후보 선별: 최근 송신 전문 중 위치 대응 일치 상위 후보. 동률 시 최근 전문 우선
+    std::array<std::uint64_t, kFinalists> top{};
+    std::array<std::size_t, kFinalists> scores{};
+    for (std::uint64_t back = 0; back < span; ++back) {
+        const std::uint64_t number = sent - back;
+        if (slotOf(number).number != number) continue;
+        rebuild(number);
+        const std::size_t score = wireAffinity(compareSent_, compareGot_);
+        for (std::size_t i = 0; i < top.size(); ++i) {
+            if (top[i] && score <= scores[i]) continue;
+            for (std::size_t k = top.size() - 1; k > i; --k) {
+                top[k] = top[k - 1];
+                scores[k] = scores[k - 1];
+            }
+            top[i] = number;
+            scores[i] = score;
+            break;
+        }
+    }
+
+    // 정렬 대조: 상이 최소, 동률 시 연속 일치 DATA·CRC 다수
+    const bool hintValid = hint && hint <= sent && slotOf(hint).number == hint;
+    const bool hintRecent = hintValid && sent - hint < span;
+    std::uint64_t bestNumber = 0;
+    WireDiff best;
+    WireDiff hinted;
+    const auto consider = [&](std::uint64_t number) {
+        rebuild(number);
+        WireDiff diff = alignWire(compareSent_, compareGot_);
+        if (number == hint) hinted = diff;
+        if (!bestNumber || diff.errors() < best.errors() ||
+            (diff.errors() == best.errors() && diff.anchored > best.anchored)) {
+            best = std::move(diff);
+            bestNumber = number;
+        }
+    };
+    if (hintValid) consider(hint);
+    for (const std::uint64_t number : top)
+        if (number && number != hint) consider(number);
+
+    // 대응 인정: 연속 일치 구간 내 DATA·CRC 4B 이상. 최근 송신 전문과 시퀀스 일치 시 1B 이상(선두 절단 전문)
+    const auto accepted = [&](std::uint64_t number, const WireDiff& diff) {
+        return number && (diff.anchored >= kMinAnchored || (number == hint && hintRecent && diff.anchored > 0));
+    };
+    std::uint64_t chosen = 0;
+    const WireDiff* diff = nullptr;
+    if (trustHint && hintValid) {
+        const bool other = bestNumber != hint && accepted(bestNumber, best) && best.errors() < hinted.errors();
+        chosen = other ? bestNumber : hint;
+        diff = other ? &best : &hinted;
+    } else if (accepted(bestNumber, best)) {
+        chosen = bestNumber;
+        diff = &best;
+    } else if (hintValid && accepted(hint, hinted)) {
+        chosen = hint;
+        diff = &hinted;
+    }
+
+    Comparison result;
+    if (!chosen) {
+        result.evidence = L"수신 원문 " + sizes + L"\r\n" + byteRows(compareGot_, L"수신");
+        return result;
+    }
+    rebuild(chosen);
+    const std::vector<std::wstring> items = diffItems(compareSent_, compareGot_, *diff);
+    const auto join = [&items](std::size_t limit, const wchar_t* separator) {
+        std::wstring text;
+        for (std::size_t i = 0; i < (std::min)(limit, items.size()); ++i) text += (i ? separator : L"") + items[i];
+        return text;
+    };
+    result.number = chosen;
+    result.summary = diff->errors() ? L"송신 대비 상이 " + grouped(diff->errors()) + L" Byte: " + join(kSummaryItems, L", ") +
+                                          (items.size() > kSummaryItems
+                                               ? L" 외 " + grouped(items.size() - kSummaryItems) + L"건"
+                                               : std::wstring())
+                                    : std::wstring(L"송신 전문과 동일");
+    result.evidence = L"송·수신 대조 · 송신 #" + std::to_wstring(chosen) + L" (시퀀스 " +
+                      sequenceText(static_cast<std::uint16_t>(chosen - 1)) + L", 송신 후 " +
+                      msText(at - slotOf(chosen).sentAt) + L") · 송신 " + grouped(compareSent_.size()) + L" Byte · 수신 " +
+                      sizes + L"\r\n" + diffTable(compareSent_, compareGot_, *diff);
+    if (items.size() > kSummaryItems) {
+        result.evidence += L"\r\n상이 항목 " + grouped(items.size()) + L"건\r\n  " + join(kEvidenceItems, L"\r\n  ");
+        if (items.size() > kEvidenceItems) result.evidence += L"\r\n  외 " + grouped(items.size() - kEvidenceItems) + L"건";
+    }
+    return result;
+}
+
+void LoopbackTest::markDamaged(std::uint64_t number)
+{
+    if (!number) return;
+    Slot& slot = slotOf(number);
+    if (slot.number == number && !slot.answered && !slot.lost) slot.damaged = true;
 }
 
 void LoopbackTest::expireThrough(std::uint64_t latest, Clock::time_point now)
@@ -467,19 +619,20 @@ void LoopbackTest::expireThrough(std::uint64_t latest, Clock::time_point now)
         if (slot.number != expireCursor_ || slot.answered || slot.lost) continue;
         slot.lost = true;
         --outstanding_;
-        fail(slot.number, L"미회신 (시퀀스 " + grouped(settings_.replyWindow) + L"회 경과)" + echoHint(slot), now);
+        fail(slot.number, L"미회신 (시퀀스 " + grouped(settings_.replyWindow) + L"회 경과)" + missHint(slot), now);
     }
 }
 
-std::wstring LoopbackTest::echoHint(const Slot& slot) const
+std::wstring LoopbackTest::missHint(const Slot& slot) const
 {
+    if (slot.damaged) return L". 기한 내 손상 회신 수신";
     if (!slot.localEchoSeen) return {};
     return echoDetected_ ? L". 기한 내 송신 반향만 수신 (장치 무회신 또는 회신 지연)"
                          : L". 기한 내 사본 1건만 수신: 장치 무회신·회신 지연 또는 송신 반향 미발생 어댑터 (송신 반향 설정 확인)";
 }
 
 void LoopbackTest::fail(std::uint64_t number, const std::wstring& text, Clock::time_point at, bool log,
-                        std::uint64_t count)
+                        std::uint64_t count, std::wstring evidence)
 {
     state_.failed += count;
     state_.verdict = Verdict::Fail;
@@ -491,7 +644,7 @@ void LoopbackTest::fail(std::uint64_t number, const std::wstring& text, Clock::t
         state_.firstFailureAt = sinceStart(at);
         state_.firstFailure = firstLine(tagged);
     }
-    if (log) detail(tagged, at);
+    if (log) detail(tagged, at, std::move(evidence));
 }
 
 void LoopbackTest::pass(Clock::duration latency, Clock::time_point at)
@@ -503,12 +656,21 @@ void LoopbackTest::pass(Clock::duration latency, Clock::time_point at)
     if (us > state_.maxLatency) state_.maxLatency = us;
 }
 
-void LoopbackTest::detail(const std::wstring& text, Clock::time_point at)
+// 화면 상한 초과분은 기록 파일 전용 상세 기록(별도 상한)
+void LoopbackTest::detail(const std::wstring& text, Clock::time_point at, std::wstring evidence)
 {
-    if (loggedFailures_ >= detailLogLimit) return;
-    note(text);
+    const bool screen = loggedFailures_ < detailLogLimit;
+    if (!screen && filedFailures_ >= fileDetailLimit) return;
+    note(text, admitEvidence(std::move(evidence)), !screen);
+    if (!screen) {
+        if (++filedFailures_ == fileDetailLimit)
+            note(L"기록 파일 이상 상세 기록 " + grouped(fileDetailLimit) + L"건 도달. 이후 " +
+                     std::to_wstring(summaryInterval.count()) + L"분 주기 요약만 기록.",
+                 {}, true);
+        return;
+    }
     if (++loggedFailures_ == detailLogLimit) {
-        note(L"이상 상세 기록 " + std::to_wstring(detailLogLimit) + L"건 도달. 이후 " +
+        note(L"이상 상세 기록 " + std::to_wstring(detailLogLimit) + L"건 도달. 이후 화면은 " +
              std::to_wstring(summaryInterval.count()) + L"분 주기 요약 기록.");
         startSummaries(at);
     }
@@ -516,13 +678,30 @@ void LoopbackTest::detail(const std::wstring& text, Clock::time_point at)
 
 void LoopbackTest::lateDetail(const std::wstring& text, Clock::time_point at)
 {
-    if (loggedLate_ >= detailLogLimit) return;
-    note(text);
+    const bool screen = loggedLate_ < detailLogLimit;
+    if (!screen && filedLate_ >= fileDetailLimit) return;
+    note(text, {}, !screen);
+    if (!screen) {
+        if (++filedLate_ == fileDetailLimit)
+            note(L"기록 파일 지연 상세 기록 " + grouped(fileDetailLimit) + L"건 도달. 이후 " +
+                     std::to_wstring(summaryInterval.count()) + L"분 주기 요약만 기록.",
+                 {}, true);
+        return;
+    }
     if (++loggedLate_ == detailLogLimit) {
-        note(L"지연 상세 기록 " + std::to_wstring(detailLogLimit) + L"건 도달. 이후 " +
+        note(L"지연 상세 기록 " + std::to_wstring(detailLogLimit) + L"건 도달. 이후 화면은 " +
              std::to_wstring(summaryInterval.count()) + L"분 주기 요약 기록.");
         startSummaries(at);
     }
+}
+
+std::wstring LoopbackTest::admitEvidence(std::wstring evidence)
+{
+    if (evidence.empty()) return evidence;
+    if (evidenceLogged_ >= evidenceLogLimit) return {};
+    if (++evidenceLogged_ == evidenceLogLimit)
+        evidence += L"\r\n송·수신 대조 기록(대조표·수신 원문) " + grouped(evidenceLogLimit) + L"건 도달. 이후 생략.";
+    return evidence;
 }
 
 void LoopbackTest::startSummaries(Clock::time_point at)
@@ -549,9 +728,9 @@ void LoopbackTest::summarize(Clock::time_point now)
     summarizedAt_ = now;
 }
 
-void LoopbackTest::note(std::wstring text)
+void LoopbackTest::note(std::wstring text, std::wstring evidence, bool fileOnly)
 {
-    events_.push_back({std::chrono::system_clock::now(), std::move(text)});
+    events_.push_back({std::chrono::system_clock::now(), std::move(text), std::move(evidence), fileOnly});
     if (events_.size() > eventQueueLimit) events_.pop_front();
 }
 

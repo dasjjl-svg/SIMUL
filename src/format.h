@@ -40,17 +40,4 @@ std::wstring msText(std::chrono::duration<Rep, Period> value)
     return buffer;
 }
 
-inline std::wstring hexText(const std::uint8_t* data, std::size_t size)
-{
-    static const wchar_t digits[] = L"0123456789ABCDEF";
-    std::wstring text;
-    text.reserve(size * 3);
-    for (std::size_t i = 0; i < size; ++i) {
-        if (i) text.push_back(L' ');
-        text.push_back(digits[data[i] >> 4]);
-        text.push_back(digits[data[i] & 0x0F]);
-    }
-    return text;
-}
-
 }  // namespace loopback

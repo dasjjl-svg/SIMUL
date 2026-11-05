@@ -22,7 +22,7 @@ enum class Verdict { Pending, Ok, Fail, Stopped };
 struct TestSettings {
     TransportConfig transport;
     std::chrono::seconds duration = std::chrono::hours(1);
-    std::chrono::milliseconds interval{50};       // 송신 주기 50ms 고정
+    std::chrono::milliseconds interval{50};       // 송신 주기(기본 50ms)
     // 회신 허용 시퀀스 수: 후속 전문 replyWindow건 송신 시점까지 미회신이면 이상
     std::uint32_t replyWindow = 5;
 };
@@ -30,6 +30,8 @@ struct TestSettings {
 struct TestEvent {
     std::chrono::system_clock::time_point wall;
     std::wstring text;
+    std::wstring evidence;   // 기록 파일 전용 후속 행: 송·수신 대조표 또는 수신 원문
+    bool fileOnly = false;   // 기록 파일 전용: 화면 상세 기록 상한 초과분
 };
 
 struct TestSnapshot {
@@ -55,13 +57,16 @@ struct TestSnapshot {
 // 송신 전문별 판정: 후속 전문 replyWindow건(기본 5) 송신 전까지 시퀀스·DATA 일치 회신 시 정상. 도착 순서 무관
 // 기한 내 미회신은 이상. 기한 경과 후 도착분은 지연 회신 기록만 수행(이상 중복 계수 없음)
 // 시험 시간 종료 후 기한은 송신 주기 기준 가상 시퀀스로 판정
-// 수신 이상(전문 불량·대응 없는 전문·DATA 불일치·중복 회신·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 이상
+// 수신 이상(전문 불량·대응 없는 전문·시퀀스 불일치·DATA 불일치·중복 회신·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 이상
+// 데이터 이상은 최근 송신 전문 중 대응 전문 추정 후 회선 바이트 대조(상이 위치·값·비트) 기록
 // RS-485 2선식 송신 반향 미발생 설정: 전문 선로 시간 1.5배(송·회신 합의 75%) 미만 사본 또는 송신 중 송신 전문 동일 바이트 수신은
 // 송신 반향으로 판정(이상 계수 후 반향 제거 전환)
 class LoopbackTest {
 public:
     static constexpr std::size_t timelineSlots = 96;     // 판정 추이 구간 수. 시험 시간 균등 분할
-    static constexpr std::size_t detailLogLimit = 100;   // 이상·지연 각각의 상세 기록 상한
+    static constexpr std::size_t detailLogLimit = 100;   // 화면 이상·지연 각각의 상세 기록 상한
+    static constexpr std::size_t fileDetailLimit = 10000;  // 화면 상한 초과 후 기록 파일 전용 상세 기록 상한(이상·지연 각각)
+    static constexpr std::size_t evidenceLogLimit = 1000;  // 송·수신 대조 기록(대조표·수신 원문) 상한
     static constexpr std::size_t eventQueueLimit = 1000;
     static constexpr std::chrono::minutes summaryInterval{10};   // 상세 기록 상한 도달 후 요약 주기
     static constexpr std::chrono::milliseconds idleWait{100};    // 수신 대기 상한. 통상 대기는 다음 송신 주기까지
@@ -95,6 +100,13 @@ private:
         bool answered = false;
         bool lost = false;           // 회신 기한 경과 미회신(이상 처리 완료)
         bool localEchoSeen = false;
+        bool damaged = false;        // 회신 기한 내 대응 손상 전문 수신
+    };
+
+    struct Comparison {
+        std::uint64_t number = 0;  // 대응 송신 전문 번호. 0: 특정 불가
+        std::wstring summary;      // 상이 요약. 대응 전문 특정 시에만
+        std::wstring evidence;     // 송·수신 대조표 또는 수신 원문(기록 파일 전용)
     };
 
     void run();
@@ -106,17 +118,24 @@ private:
     void record(std::uint64_t number, const Frame& frame, std::size_t wireBytes, Clock::time_point at);
     void handleFrame(const ParseResult& parsed, const Frame& got, Clock::time_point at);
     void flushNoise();  // 누적 전문 외 수신 1건 계수
+    // 수신 회선 바이트(total: 실제 길이)의 대응 송신 전문 추정·대조. hint: 수신 시퀀스 해당 전문 번호(0: 없음)
+    // trustHint: 정상 CRC 전문. 타 전문이 명백히 더 유사하지 않으면 hint 전문 기준 대조
+    Comparison compare(const Buffer& received, std::uint64_t total, std::uint64_t hint, bool trustHint,
+                       Clock::time_point at);
+    void markDamaged(std::uint64_t number);
     // 후속 전문 latest번까지 송신 기준 회신 기한 경과 전문 이상 처리
     void expireThrough(std::uint64_t latest, Clock::time_point now);
-    std::wstring echoHint(const Slot& slot) const;
+    // 미회신 부가 정보: 손상 회신·송신 반향 수신 여부
+    std::wstring missHint(const Slot& slot) const;
     void fail(std::uint64_t number, const std::wstring& text, Clock::time_point at, bool log = true,
-              std::uint64_t count = 1);
+              std::uint64_t count = 1, std::wstring evidence = {});
     void pass(Clock::duration latency, Clock::time_point at);
-    void detail(const std::wstring& text, Clock::time_point at);
+    void detail(const std::wstring& text, Clock::time_point at, std::wstring evidence);
     void lateDetail(const std::wstring& text, Clock::time_point at);
+    std::wstring admitEvidence(std::wstring evidence);  // 대조표 기록 상한 적용
     void startSummaries(Clock::time_point at);
     void summarize(Clock::time_point now);
-    void note(std::wstring text);
+    void note(std::wstring text, std::wstring evidence = {}, bool fileOnly = false);
     void remember(std::uint8_t mark, Clock::time_point at);
     std::chrono::milliseconds sinceStart(Clock::time_point at) const;
     // 반이중 선로 장치 회신 완료 하한: 송신·회신 전문 선로 시간 합의 75% (통신 속도 오차 여유)
@@ -139,6 +158,9 @@ private:
     std::uint64_t latencySumUs_ = 0;
     std::size_t loggedFailures_ = 0;
     std::size_t loggedLate_ = 0;
+    std::size_t filedFailures_ = 0;    // 화면 상한 초과 후 기록 파일 전용 상세 기록 건수
+    std::size_t filedLate_ = 0;
+    std::size_t evidenceLogged_ = 0;
     bool summarizing_ = false;         // 상세 기록 상한 도달, 주기 요약 진행
     std::uint64_t summarizedFailures_ = 0;
     std::uint64_t summarizedLate_ = 0;
@@ -147,6 +169,11 @@ private:
 
     Buffer rxBuffer_;  // 수신 누적. 시험 시작 시 용량 선확보
     Buffer txFrame_;   // 송신 전문. 주기마다 재사용
+    // 이하 송·수신 대조용. 시험 시작 시 용량 선확보
+    Buffer frameBytes_;   // 직전 해석 전문의 회선 바이트
+    Buffer noiseSample_;  // 계수 전 전문 외 수신 바이트(앞부분, 용량 한도)
+    Buffer compareSent_;  // 대응 후보 송신 전문 재구성
+    Buffer compareGot_;   // 대조 대상 수신 바이트
     std::size_t lane_ = 0;
     Clock::time_point startedAt_{};
     bool halfDuplex_ = false;          // RS-485 2선식

@@ -61,6 +61,9 @@ struct ParseResult {
     Parse status = Parse::NeedMore;
     FrameError error = FrameError::None;
     std::size_t discarded = 0;  // STX 이전 폐기 바이트 수
+    // Ok·Invalid: DLE 복원 본문(오류 시 오류 지점까지). 송·수신 대조용
+    std::array<Byte, PAYLOAD_SIZE> body{};
+    std::size_t bodyLength = 0;
 };
 
 // 수신 버퍼 선두의 전문 1건 해석
@@ -68,6 +71,8 @@ struct ParseResult {
 //   Ok·Invalid: ETX까지 소비. 원시 STX 출현 시 직전까지, 경계 없이 304B(최대 길이 4배) 도달 시 304B 소비
 //   NeedMore: 미완 전문 보존
 // 원시 STX·ETX는 본문 내 출현 불가. DLE 직후라도 전문 경계로 판정
-ParseResult parseFrame(Buffer& inOut, Frame& frameOut);
+// frameBytes: Ok·Invalid 시 소비한 전문의 회선 바이트(STX부터) 대체 기록. 304B 용량 선확보 시 할당 없음
+// skipped: STX 이전 폐기 바이트 추가 기록. 기존 용량 한도 내 기록, 초과분 생략(할당 없음)
+ParseResult parseFrame(Buffer& inOut, Frame& frameOut, Buffer* frameBytes = nullptr, Buffer* skipped = nullptr);
 
 }  // namespace loopback

@@ -50,6 +50,7 @@ struct TransportConfig {
     SerialConfig serial;
     TcpConfig    tcp;
     UdpConfig    udp;
+    DWORD sendTimeoutMs = 250;  // 전문 1건 송신 처리 상한(직렬·TCP)
 };
 
 // 직전 receive 중 검출된 비치명 회선 이상. 건별 실패 계수 대상
@@ -94,6 +95,8 @@ struct PortInfo {
 
 std::unique_ptr<Transport> makeTransport(const TransportConfig& config);
 std::wstring describe(const TransportConfig& config);
+// 시스템 오류 코드 설명문. 말미 개행·마침표 제거
+std::wstring systemText(DWORD code);
 // 활성 COM 포트: SERIALCOMM 등록 항목 + 동작 중 장치의 장치 관리자 표시명. 번호순
 std::vector<PortInfo> enumeratePorts();
 

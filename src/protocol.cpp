@@ -49,7 +49,9 @@ void appendEscaped(Buffer& out, Byte value)
 
 ParseResult verifyBody(const Byte* body, std::size_t length, Frame& frameOut, std::size_t discarded)
 {
-    ParseResult result{Parse::Invalid, FrameError::None, discarded};
+    ParseResult result{Parse::Invalid, FrameError::None, discarded, {}, 0};
+    result.bodyLength = (std::min)(length, PAYLOAD_SIZE);
+    std::copy_n(body, result.bodyLength, result.body.begin());
     if (length != PAYLOAD_SIZE) {
         result.error = FrameError::Length;
     } else if (body[TRAILER_OFFSET] != TRAILER_HI || body[TRAILER_OFFSET + 1] != TRAILER_LO) {
@@ -86,23 +88,28 @@ void buildFrame(const Frame& frame, Buffer& out)
     out.push_back(ETX);
 }
 
-ParseResult parseFrame(Buffer& inOut, Frame& frameOut)
+ParseResult parseFrame(Buffer& inOut, Frame& frameOut, Buffer* frameBytes, Buffer* skipped)
 {
     const auto start = std::find(inOut.begin(), inOut.end(), STX);
     const auto discarded = static_cast<std::size_t>(start - inOut.begin());
+    if (skipped && discarded) {
+        const std::size_t room = skipped->capacity() - skipped->size();
+        skipped->insert(skipped->end(), inOut.begin(),
+                        inOut.begin() + static_cast<std::ptrdiff_t>((std::min)(discarded, room)));
+    }
     inOut.erase(inOut.begin(), start);
-    if (inOut.empty()) return {Parse::NeedMore, FrameError::None, discarded};
-
-    const auto consume = [&inOut](std::size_t count) {
-        inOut.erase(inOut.begin(), inOut.begin() + static_cast<std::ptrdiff_t>(count));
-    };
-    const auto invalid = [discarded](FrameError error) {
-        return ParseResult{Parse::Invalid, error, discarded};
-    };
+    if (inOut.empty()) return {Parse::NeedMore, FrameError::None, discarded, {}, 0};
 
     // 본문 오류 확정 후에도 ETX까지 동일 전문으로 소비하여 잔여 바이트의 중복 계수 방지
     std::array<Byte, PAYLOAD_SIZE> body{};
     std::size_t length = 0;
+    const auto consume = [&inOut, frameBytes](std::size_t count) {
+        if (frameBytes) frameBytes->assign(inOut.begin(), inOut.begin() + static_cast<std::ptrdiff_t>(count));
+        inOut.erase(inOut.begin(), inOut.begin() + static_cast<std::ptrdiff_t>(count));
+    };
+    const auto invalid = [discarded, &body, &length](FrameError error) {
+        return ParseResult{Parse::Invalid, error, discarded, body, length};
+    };
     const auto append = [&body, &length](Byte value) {
         if (length == PAYLOAD_SIZE) return false;
         body[length++] = value;
@@ -139,7 +146,7 @@ ParseResult parseFrame(Buffer& inOut, Frame& frameOut)
             fault = FrameError::Length;
         }
     }
-    return {Parse::NeedMore, FrameError::None, discarded};
+    return {Parse::NeedMore, FrameError::None, discarded, {}, 0};
 }
 
 }  // namespace loopback

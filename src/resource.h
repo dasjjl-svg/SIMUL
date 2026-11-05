@@ -26,6 +26,9 @@
 #define IDC_DURATION_MINUTES_UNIT   1022
 #define IDC_START_BUTTON            1023
 #define IDC_STOP_BUTTON             1024
+#define IDC_INTERVAL_LABEL          1025
+#define IDC_SEND_INTERVAL           1026
+#define IDC_INTERVAL_UNIT           1027
 
 #define IDC_CHANNEL_LIST            1030
 

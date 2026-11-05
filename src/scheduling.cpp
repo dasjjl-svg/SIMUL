@@ -45,7 +45,7 @@ std::vector<Processor> activeProcessors()
 void prepareWorkerThread(std::size_t lane)
 {
     const HANDLE thread = GetCurrentThread();
-    // 대기 위주 스레드. 타 프로그램 부하 중에도 50ms 송신 주기 유지
+    // 대기 위주 스레드. 타 프로그램 부하 중에도 송신 주기 유지
     SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST);
 
     static const std::vector<Processor> processors = activeProcessors();

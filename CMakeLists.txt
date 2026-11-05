@@ -16,6 +16,8 @@ add_executable(loopback_tester WIN32
     src/ui_draw.cpp
     src/ui_draw.h
     src/format.h
+    src/frame_diff.cpp
+    src/frame_diff.h
     src/protocol.cpp
     src/protocol.h
     src/transport.cpp

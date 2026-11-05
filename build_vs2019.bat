@@ -77,8 +77,8 @@ set "LINKFLAGS=/nologo /SUBSYSTEM:WINDOWS /MANIFEST:NO"
 if /i "%CONFIG%"=="Release" set "CXXFLAGS=%CXXFLAGS% /O2 /MT /DNDEBUG" & set "LINKFLAGS=%LINKFLAGS% /OPT:REF /OPT:ICF"
 if /i "%CONFIG%"=="Debug" set "CXXFLAGS=%CXXFLAGS% /Od /MTd /Zi /RTC1 /D_DEBUG" & set "LINKFLAGS=%LINKFLAGS% /DEBUG"
 rem 원본·목적 파일은 해당 폴더 기준 상대 이름 사용. 경로 내 특수 문자(&, ^) 해석 배제
-set "SOURCES=main.cpp app.cpp ui_draw.cpp protocol.cpp transport.cpp loopback_test.cpp scheduling.cpp"
-set "OBJECTS=main.obj app.obj ui_draw.obj protocol.obj transport.obj loopback_test.obj scheduling.obj loopback_tester.res"
+set "SOURCES=main.cpp app.cpp ui_draw.cpp frame_diff.cpp protocol.cpp transport.cpp loopback_test.cpp scheduling.cpp"
+set "OBJECTS=main.obj app.obj ui_draw.obj frame_diff.obj protocol.obj transport.obj loopback_test.obj scheduling.obj loopback_tester.res"
 set "LIBS=kernel32.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ws2_32.lib winmm.lib uxtheme.lib setupapi.lib cfgmgr32.lib"
 
 echo.
