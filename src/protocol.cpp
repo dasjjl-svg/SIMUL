@@ -1,41 +1,36 @@
 #include "protocol.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <random>
 
 namespace loopback {
 
-std::uint16_t crc16(const Byte* data, std::size_t size)
-{
-    std::uint16_t crc = 0xFFFF;
-    for (std::size_t i = 0; i < size; ++i) {
-        crc = static_cast<std::uint16_t>(crc ^ (data[i] << 8));
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x8000) ? static_cast<std::uint16_t>((crc << 1) ^ 0x1021)
-                                 : static_cast<std::uint16_t>(crc << 1);
-        }
-    }
-    return crc;
-}
-
-void randomData(Data& out)
-{
-    // 결정적 random_device 구현 대비 단조 시계값 혼합
-    thread_local std::mt19937 engine = [] {
-        std::random_device device;
-        const auto tick = static_cast<std::uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        std::seed_seq seed{device(), device(), device(), device(),
-                           static_cast<unsigned>(tick & 0xFFFFFFFFu),
-                           static_cast<unsigned>(tick >> 32)};
-        return std::mt19937(seed);
-    }();
-    std::uniform_int_distribution<unsigned> dist(0x00, 0xFF);
-    for (auto& byte : out) byte = static_cast<Byte>(dist(engine));
-}
-
 namespace {
+
+constexpr std::array<std::uint16_t, 256> makeCrcTable()
+{
+    std::array<std::uint16_t, 256> table{};
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        auto crc = static_cast<std::uint16_t>(i << 8);
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc & 0x8000) ? static_cast<std::uint16_t>((crc << 1) ^ 0x1021) : static_cast<std::uint16_t>(crc << 1);
+        table[i] = crc;
+    }
+    return table;
+}
+
+constexpr std::array<std::uint16_t, 256> kCrcTable = makeCrcTable();
+
+// splitmix64 혼합 함수: 입력 1비트 변화가 출력 전 비트에 확산
+std::uint64_t mix(std::uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
 
 void appendEscaped(Buffer& out, Byte value)
 {
@@ -47,21 +42,23 @@ void appendEscaped(Buffer& out, Byte value)
     }
 }
 
-ParseResult verifyBody(const Byte* body, std::size_t length, Frame& frameOut, std::size_t discarded)
+ParseResult verifyBody(const Byte* body, std::size_t length, Frame& frameOut, std::size_t dataSize,
+                       std::size_t discarded)
 {
-    ParseResult result{Parse::Invalid, FrameError::None, discarded, {}, 0};
-    result.bodyLength = (std::min)(length, PAYLOAD_SIZE);
-    std::copy_n(body, result.bodyLength, result.body.begin());
-    if (length != PAYLOAD_SIZE) {
+    ParseResult result{Parse::Invalid, FrameError::None, discarded, length, 0};
+    if (length >= DATA_OFFSET)
+        result.sequence = static_cast<std::uint16_t>((body[SEQUENCE_OFFSET] << 8) | body[SEQUENCE_OFFSET + 1]);
+    const std::size_t crcAt = crcOffset(dataSize);
+    const std::size_t trailerAt = trailerOffset(dataSize);
+    if (length != payloadSize(dataSize)) {
         result.error = FrameError::Length;
-    } else if (body[TRAILER_OFFSET] != TRAILER_HI || body[TRAILER_OFFSET + 1] != TRAILER_LO) {
+    } else if (body[trailerAt] != TRAILER_HI || body[trailerAt + 1] != TRAILER_LO) {
         result.error = FrameError::Trailer;
-    } else if (static_cast<std::uint16_t>((body[CRC_OFFSET] << 8) | body[CRC_OFFSET + 1]) !=
-               crc16(body, CRC_OFFSET)) {
+    } else if (static_cast<std::uint16_t>((body[crcAt] << 8) | body[crcAt + 1]) != crc16(body, crcAt)) {
         result.error = FrameError::Crc;
     } else {
-        frameOut.sequence = static_cast<std::uint16_t>((body[SEQUENCE_OFFSET] << 8) | body[SEQUENCE_OFFSET + 1]);
-        std::copy_n(body + DATA_OFFSET, DATA_SIZE, frameOut.data.begin());
+        frameOut.sequence = result.sequence;
+        frameOut.data.assign(body + DATA_OFFSET, body + crcAt);
         result.status = Parse::Ok;
     }
     return result;
@@ -69,26 +66,53 @@ ParseResult verifyBody(const Byte* body, std::size_t length, Frame& frameOut, st
 
 }  // namespace
 
+std::uint16_t crc16(const Byte* data, std::size_t size, std::uint16_t crc)
+{
+    for (std::size_t i = 0; i < size; ++i)
+        crc = static_cast<std::uint16_t>((crc << 8) ^ kCrcTable[((crc >> 8) ^ data[i]) & 0xFF]);
+    return crc;
+}
+
+std::uint64_t randomKey(std::uint64_t salt)
+{
+    // 결정적 random_device 구현 대비 단조 시계값·구분값 혼합
+    std::random_device device;
+    const auto tick = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::uint64_t key = mix(tick) ^ mix(salt);
+    for (int i = 0; i < 4; ++i) key = mix(key ^ static_cast<std::uint64_t>(device()));
+    return key;
+}
+
+void frameData(std::uint64_t key, std::uint64_t number, Byte* out, std::size_t size)
+{
+    // 전문별 기준값 + 8바이트 단위 계수 혼합(계수 방식). 임의 전문·위치 독립 재생성
+    const std::uint64_t base = mix(key ^ mix(number));
+    for (std::size_t i = 0; i < size; i += 8) {
+        const std::uint64_t word = mix(base + i);
+        const std::size_t count = (std::min)(std::size_t{8}, size - i);
+        for (std::size_t k = 0; k < count; ++k) out[i + k] = static_cast<Byte>(word >> (8 * k));
+    }
+}
+
 void buildFrame(const Frame& frame, Buffer& out)
 {
-    std::array<Byte, PAYLOAD_SIZE> body{};
-    body[SEQUENCE_OFFSET] = static_cast<Byte>(frame.sequence >> 8);
-    body[SEQUENCE_OFFSET + 1] = static_cast<Byte>(frame.sequence & 0xFF);
-    std::copy(frame.data.begin(), frame.data.end(), body.begin() + DATA_OFFSET);
-    const std::uint16_t crc = crc16(body.data(), CRC_OFFSET);
-    body[CRC_OFFSET] = static_cast<Byte>(crc >> 8);
-    body[CRC_OFFSET + 1] = static_cast<Byte>(crc & 0xFF);
-    body[TRAILER_OFFSET] = TRAILER_HI;
-    body[TRAILER_OFFSET + 1] = TRAILER_LO;
+    const std::size_t dataSize = frame.data.size();
+    const Byte sequence[2] = {static_cast<Byte>(frame.sequence >> 8), static_cast<Byte>(frame.sequence & 0xFF)};
+    const std::uint16_t crc = crc16(frame.data.data(), dataSize, crc16(sequence, 2));
 
     out.clear();
-    out.reserve(MAX_FRAME_SIZE);
+    out.reserve(maxFrameSize(dataSize));
     out.push_back(STX);
-    for (Byte b : body) appendEscaped(out, b);
+    for (Byte b : sequence) appendEscaped(out, b);
+    for (Byte b : frame.data) appendEscaped(out, b);
+    appendEscaped(out, static_cast<Byte>(crc >> 8));
+    appendEscaped(out, static_cast<Byte>(crc & 0xFF));
+    out.push_back(TRAILER_HI);
+    out.push_back(TRAILER_LO);
     out.push_back(ETX);
 }
 
-ParseResult parseFrame(Buffer& inOut, Frame& frameOut, Buffer* frameBytes, Buffer* skipped)
+ParseResult parseFrame(Buffer& inOut, Frame& frameOut, std::size_t dataSize, Buffer* frameBytes, Buffer* skipped)
 {
     const auto start = std::find(inOut.begin(), inOut.end(), STX);
     const auto discarded = static_cast<std::size_t>(start - inOut.begin());
@@ -98,20 +122,25 @@ ParseResult parseFrame(Buffer& inOut, Frame& frameOut, Buffer* frameBytes, Buffe
                         inOut.begin() + static_cast<std::ptrdiff_t>((std::min)(discarded, room)));
     }
     inOut.erase(inOut.begin(), start);
-    if (inOut.empty()) return {Parse::NeedMore, FrameError::None, discarded, {}, 0};
+    if (inOut.empty()) return {Parse::NeedMore, FrameError::None, discarded, 0, 0};
 
     // 본문 오류 확정 후에도 ETX까지 동일 전문으로 소비하여 잔여 바이트의 중복 계수 방지
-    std::array<Byte, PAYLOAD_SIZE> body{};
+    const std::size_t capacity = payloadSize(dataSize);
+    const std::size_t maxFrame = maxFrameSize(dataSize);
+    std::array<Byte, MAX_PAYLOAD_SIZE> body{};
     std::size_t length = 0;
     const auto consume = [&inOut, frameBytes](std::size_t count) {
         if (frameBytes) frameBytes->assign(inOut.begin(), inOut.begin() + static_cast<std::ptrdiff_t>(count));
         inOut.erase(inOut.begin(), inOut.begin() + static_cast<std::ptrdiff_t>(count));
     };
     const auto invalid = [discarded, &body, &length](FrameError error) {
-        return ParseResult{Parse::Invalid, error, discarded, body, length};
+        ParseResult result{Parse::Invalid, error, discarded, length, 0};
+        if (length >= DATA_OFFSET)
+            result.sequence = static_cast<std::uint16_t>((body[SEQUENCE_OFFSET] << 8) | body[SEQUENCE_OFFSET + 1]);
+        return result;
     };
-    const auto append = [&body, &length](Byte value) {
-        if (length == PAYLOAD_SIZE) return false;
+    const auto append = [&body, &length, capacity](Byte value) {
+        if (length == capacity) return false;
         body[length++] = value;
         return true;
     };
@@ -127,14 +156,14 @@ ParseResult parseFrame(Buffer& inOut, Frame& frameOut, Buffer* frameBytes, Buffe
             consume(i + 1);
             if (fault == FrameError::None && escaping) fault = FrameError::Escape;
             if (fault != FrameError::None) return invalid(fault);
-            return verifyBody(body.data(), length, frameOut, discarded);
+            return verifyBody(body.data(), length, frameOut, dataSize, discarded);
         }
         // 최대 길이 초과 전문은 ETX·STX까지 동일 전문으로 소비. 경계 없는 바이트열은 4배 길이에서 절단
-        if (i + 1 >= MAX_FRAME_SIZE * 4) {
+        if (i + 1 >= maxFrame * 4) {
             consume(i + 1);
             return invalid(fault != FrameError::None ? fault : FrameError::Length);
         }
-        if (i + 1 >= MAX_FRAME_SIZE && fault == FrameError::None) fault = FrameError::Length;
+        if (i + 1 >= maxFrame && fault == FrameError::None) fault = FrameError::Length;
         if (fault != FrameError::None) continue;
         if (escaping) {
             escaping = false;
@@ -146,7 +175,7 @@ ParseResult parseFrame(Buffer& inOut, Frame& frameOut, Buffer* frameBytes, Buffe
             fault = FrameError::Length;
         }
     }
-    return {Parse::NeedMore, FrameError::None, discarded, {}, 0};
+    return {Parse::NeedMore, FrameError::None, discarded, 0, 0};
 }
 
 }  // namespace loopback

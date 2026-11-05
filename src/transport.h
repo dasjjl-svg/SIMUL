@@ -85,6 +85,8 @@ public:
     }
     // 개방 시 적용 조건 변경 등 기록 대상 안내
     virtual std::wstring notice() const { return {}; }
+    // 진행 중 송신 완료 대기 즉시 중단(시험 중지용). 타 스레드 호출 허용
+    virtual void abortSend() {}
 };
 
 struct PortInfo {

@@ -13,11 +13,13 @@ namespace loopback {
 
 namespace {
 
-constexpr std::size_t kCompareBytes = MAX_FRAME_SIZE * 2;  // 대조 대상 수신 바이트 상한
+constexpr std::size_t kRawShown = 256;         // 수신 원문 기록 상한
 constexpr std::uint64_t kCompareMargin = 64;   // 대응 후보: 최근 송신 전문(회신 허용 시퀀스 + 64건)
 constexpr std::uint64_t kCompareSpan = 1024;   // 대응 후보 최근 송신 전문 상한
+constexpr std::size_t kScanBytes = 256 * 1024;  // 후보 선별 재구성 바이트 상한(장문 전문 대조 비용 상한)
+constexpr std::size_t kCheapFrame = 256;        // 최대 전문 길이 미만(DATA 약 120B 이하)은 후보 전부 정렬
 constexpr std::size_t kFinalists = 4;          // 정렬 대조 대상 상위 후보 수
-constexpr std::size_t kMinAnchored = 4;        // 대응 인정 하한: 연속 일치 구간 내 DATA·CRC 바이트 수
+constexpr std::size_t kMinAnchored = 4;        // 대응 인정 하한: 연속 일치 구간 내 DATA·CRC 바이트 수(DATA 3B 이상)
 constexpr std::size_t kNoiseCompareMin = 8;    // 전문 외 수신의 송신 전문 대조 하한 길이
 constexpr std::size_t kSummaryItems = 3;       // 상이 요약 항목 상한
 constexpr std::size_t kEvidenceItems = 64;     // 대조표 상이 항목 상한
@@ -69,6 +71,10 @@ bool LoopbackTest::open(const TestSettings& settings, std::wstring& error)
     const double stop = serial.stopBits == ONESTOPBIT ? 1.0 : serial.stopBits == ONE5STOPBITS ? 1.5 : 2.0;
     const double bits = 1.0 + serial.dataBits + (serial.parity != NOPARITY ? 1.0 : 0.0) + stop;
     charMicros_ = serial.baud ? bits * 1e6 / static_cast<double>(serial.baud) : 0.0;
+    maxFrame_ = maxFrameSize(settings.dataSize);
+    compareLimit_ = maxFrame_ * 2;
+    compareBudget_ = std::clamp(Clock::duration(settings.interval / 4), Clock::duration(std::chrono::milliseconds(2)),
+                                Clock::duration(std::chrono::milliseconds(10)));
     // 정적 확인 구간: 직렬 문자 24개(수신 FIFO 2회 전달분)와 20ms(USB 변환기 전달 지연 포함) 중 큰 값
     const bool serialKind = settings.transport.kind == TransportKind::Serial;
     const auto chars = std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(
@@ -76,12 +82,12 @@ bool LoopbackTest::open(const TestSettings& settings, std::wstring& error)
     settleWait_ = (std::max)(Clock::duration(std::chrono::milliseconds(20)), Clock::duration(chars));
     // 기한 경과 시점 수신 진행 중 전문의 완결 대기: 최대 전문 선로 시간 + 정적 확인 구간
     drainGrace_ = Clock::duration(std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(
-                      serialKind ? charMicros_ * static_cast<double>(MAX_FRAME_SIZE) : 0.0))) +
+                      serialKind ? charMicros_ * static_cast<double>(maxFrame_) : 0.0))) +
                   settleWait_;
-    // 전문 1건 송신 처리 상한: 최대 전문 2건 선로 시간(저속 직렬 대응) + 100ms, 최소 250ms
+    // 전문 1건 송신 처리 상한: 직렬은 최대 전문 2건 선로 시간(저속 대응) + 100ms, 최소 250ms. TCP는 250ms
     TransportConfig transport = settings.transport;
     transport.sendTimeoutMs = static_cast<DWORD>((std::max)(
-        250.0, std::ceil(2.0 * static_cast<double>(MAX_FRAME_SIZE) * charMicros_ / 1000.0) + 100.0));
+        250.0, std::ceil(2.0 * static_cast<double>(maxFrame_) * (serialKind ? charMicros_ : 0.0) / 1000.0) + 100.0));
     transport_ = makeTransport(transport);
     if (!transport_) { error = L"접속 방식 미지원."; return false; }
     if (!transport_->open(error)) { transport_.reset(); return false; }
@@ -119,15 +125,20 @@ void LoopbackTest::begin(std::size_t lane)
         const std::wstring notice = transport_->notice();
         if (!notice.empty()) note(notice);
         frameBytes_.clear();
-        frameBytes_.reserve(MAX_FRAME_SIZE * 4);
+        frameBytes_.reserve(maxFrame_ * 4);
         noiseSample_.clear();
-        noiseSample_.reserve(kCompareBytes);
-        compareSent_.reserve(MAX_FRAME_SIZE);
-        compareGot_.reserve(kCompareBytes);
+        noiseSample_.reserve(compareLimit_);
+        compareSent_.reserve(maxFrame_);
+        compareGot_.reserve(compareLimit_);
+        rxFrame_.data.reserve(settings_.dataSize);
+        compareFrame_.data.resize(settings_.dataSize);
+        expected_.resize(settings_.dataSize);
+        std::uint64_t salt = reinterpret_cast<std::uintptr_t>(this);
+        dataKey_ = randomKey(salt ^ (static_cast<std::uint64_t>(lane) << 48));
     }
     rxBuffer_.clear();
     rxBuffer_.reserve(65536);
-    txFrame_.reserve(MAX_FRAME_SIZE);
+    txFrame_.reserve(maxFrame_);
     lane_ = lane;
     startedAt_ = Clock::now();
     cancel_.store(false);
@@ -137,6 +148,8 @@ void LoopbackTest::begin(std::size_t lane)
 void LoopbackTest::cancel()
 {
     cancel_.store(true);
+    // 장기 송신 대기(저속·흐름 제어 정체) 중 중지 지연 방지. 중단된 송신은 사용자 중지로 처리
+    if (transport_) transport_->abortSend();
 }
 
 void LoopbackTest::stop()
@@ -187,6 +200,7 @@ void LoopbackTest::run()
     std::uint64_t number = 0;
     Clock::time_point lastSentAt = startedAt_;
     Frame frame;
+    frame.data.resize(settings_.dataSize);
     std::wstring abortReason;
     Clock::time_point lastRxAt = startedAt_;  // 최근 수신 시각(정적 구간 판정 기준)
 
@@ -197,6 +211,7 @@ void LoopbackTest::run()
             // 최종 전문 송신 결과 확인. 실패 시 송신 오류로 시험 중단
             std::wstring error;
             if (!transport_->flush(error)) {
+                if (cancel_.load()) break;
                 abortReason = L"송신 오류: " + error;
                 collectReceived();
                 break;
@@ -223,11 +238,12 @@ void LoopbackTest::run()
         if (!draining && now >= nextTx) {
             ++number;
             frame.sequence = static_cast<std::uint16_t>(number - 1);
-            randomData(frame.data);
+            frameData(dataKey_, number, frame.data.data(), frame.data.size());
             buildFrame(frame, txFrame_);
             std::wstring error;
             const auto before = Clock::now();
             if (!transport_->send(txFrame_, error)) {
+                if (cancel_.load()) break;
                 abortReason = L"송신 오류: " + error;
                 collectReceived();
                 break;
@@ -238,7 +254,7 @@ void LoopbackTest::run()
             std::lock_guard<std::mutex> lock(mutex_);
             // 잡음 계수 단위 상한: 송신 주기 1회. 진행 중 단발 잡음 분할 방지 위해 1주기 이상 지속분만 확정
             if (noiseBytes_ && issued - noiseAt_ >= settings_.interval) flushNoise();
-            record(number, frame, txFrame_.size(), issued);
+            record(number, txFrame_.size(), issued);
             // 1주기 이상 지연 송신은 누락 주기 실패 계수 (절전·스케줄링 정지·회선 정체·송신 정체)
             // 누락 주기는 시험 시간 내 예정분만 계수, 최소 1주기
             const auto slot = nextTx;
@@ -298,14 +314,15 @@ void LoopbackTest::run()
                 fail(0, fault.text + (fault.count > 1 ? L" 외 " + grouped(fault.count - 1) + L"건" : std::wstring()),
                      at, true, fault.count);
             }
+            compareUntil_ = at + compareBudget_;
             // 잔여 회신 대기 중 회신 기한: 최종 송신 이후 송신 주기 경과 수를 가상 시퀀스로 적용. 수신분 해석 전 기한 확정
             if (draining && number)
                 expireThrough(number + static_cast<std::uint64_t>((at - lastSentAt) / settings_.interval), at);
             // 치명 오류 시에도 동일 호출에서 수신 완료된 전문은 판정 반영
             for (;;) {
-                Frame got;
-                const ParseResult parsed = parseFrame(rxBuffer_, got, &frameBytes_, &noiseSample_);
-                handleFrame(parsed, got, at);
+                const ParseResult parsed =
+                    parseFrame(rxBuffer_, rxFrame_, settings_.dataSize, &frameBytes_, &noiseSample_);
+                handleFrame(parsed, rxFrame_, at);
                 if (parsed.status == Parse::NeedMore) break;
             }
             // 정적 구간 경과 시 잡음 1회 발생 확정. 수신 분할 단위와 무관
@@ -328,13 +345,13 @@ void LoopbackTest::collectReceived()
     const LineFault fault = transport_->takeFault();
     const auto at = Clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
+    compareUntil_ = at + compareBudget_;
     if (fault.count)
         fail(0, fault.text + (fault.count > 1 ? L" 외 " + grouped(fault.count - 1) + L"건" : std::wstring()), at, true,
              fault.count);
     for (;;) {
-        Frame got;
-        const ParseResult parsed = parseFrame(rxBuffer_, got, &frameBytes_, &noiseSample_);
-        handleFrame(parsed, got, at);
+        const ParseResult parsed = parseFrame(rxBuffer_, rxFrame_, settings_.dataSize, &frameBytes_, &noiseSample_);
+        handleFrame(parsed, rxFrame_, at);
         if (parsed.status == Parse::NeedMore) break;
     }
 }
@@ -343,6 +360,7 @@ void LoopbackTest::finish(const std::wstring& abortReason)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto end = Clock::now();
+    compareUntil_ = end + compareBudget_;
     flushNoise();
     const bool aborted = !abortReason.empty();
     // 시험 시간 경과 후 중지는 잔여 회신 대기 중 중지(화면 표시 경과 시간 기준과 일치)
@@ -392,15 +410,14 @@ void LoopbackTest::finish(const std::wstring& abortReason)
     state_.running = false;
 }
 
-void LoopbackTest::record(std::uint64_t number, const Frame& frame, std::size_t wireBytes, Clock::time_point at)
+void LoopbackTest::record(std::uint64_t number, std::size_t wireBytes, Clock::time_point at)
 {
     ++state_.sent;
     Slot& slot = slotOf(number);
     slot = Slot{};
     slot.number = number;
-    slot.data = frame.data;
     slot.sentAt = at;
-    slot.wireBytes = static_cast<std::uint8_t>(wireBytes);
+    slot.wireBytes = static_cast<std::uint16_t>(wireBytes);
     ++outstanding_;
     expireThrough(number, at);
 }
@@ -418,23 +435,23 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Frame& got, Cloc
     if (parsed.status == Parse::Invalid) {
         ++state_.received;
         // 손상 전문의 시퀀스 해석값(본문 2B 이상 복원 시)은 대응 후보로만 사용
-        std::uint64_t hint = 0;
-        if (parsed.bodyLength >= DATA_OFFSET)
-            hint = slots_[static_cast<std::uint16_t>((parsed.body[SEQUENCE_OFFSET] << 8) |
-                                                     parsed.body[SEQUENCE_OFFSET + 1])].number;
-        Comparison match = compare(frameBytes_, frameBytes_.size(), hint, false, at);
+        const std::uint64_t hint = parsed.bodyLength >= DATA_OFFSET ? slots_[parsed.sequence].number : 0;
+        Comparison match = examine(frameBytes_, frameBytes_.size(), hint, false, at);
         markDamaged(match.number);
+        const std::wstring size = L"수신 " + grouped(frameBytes_.size()) + L" Byte";
         fail(match.number,
              std::wstring(L"전문 불량: ") + describe(parsed.error) + L". " +
-                 (match.number ? match.summary : L"대응 송신 전문 특정 불가 (수신 " + grouped(frameBytes_.size()) + L" Byte)"),
+                 (match.number    ? match.summary
+                  : match.skipped ? L"송·수신 대조 생략 (" + size + L", 수신 처리 시간 상한)"
+                                  : L"대응 송신 전문 특정 불가 (" + size + L")"),
              at, true, 1, std::move(match.evidence));
         return;
     }
 
     Slot& slot = slots_[got.sequence];
-    if (!slot.number || slot.data != got.data) {
+    if (!slot.number || !dataMatches(slot.number, got.data)) {
         ++state_.received;
-        Comparison match = compare(frameBytes_, frameBytes_.size(), slot.number, true, at);
+        Comparison match = examine(frameBytes_, frameBytes_.size(), slot.number, true, at);
         markDamaged(match.number);
         std::wstring text;
         if (match.number && match.number != slot.number)
@@ -444,7 +461,9 @@ void LoopbackTest::handleFrame(const ParseResult& parsed, const Frame& got, Cloc
             text = L"DATA 불일치 (시퀀스 " + sequenceText(got.sequence) + L")";
         else
             text = L"송신 대응 없는 전문 수신 (시퀀스 " + sequenceText(got.sequence) + L")";
-        fail(match.number, match.number ? text + L". " + match.summary : text, at, true, 1, std::move(match.evidence));
+        if (match.number) text += L". " + match.summary;
+        else if (match.skipped) text += L". 송·수신 대조 생략 (수신 처리 시간 상한)";
+        fail(match.number, text, at, true, 1, std::move(match.evidence));
         return;
     }
     if (slot.answered) {
@@ -495,12 +514,13 @@ void LoopbackTest::flushNoise()
     // 송신 전문 길이 수준 잡음은 STX 손상 전문 여부 대조
     Comparison match;
     if (noiseSample_.size() >= kNoiseCompareMin) {
-        match = compare(noiseSample_, noiseBytes_, 0, false, noiseAt_);
-    } else {
-        match.evidence = L"수신 원문 " + grouped(noiseBytes_) + L" Byte\r\n" + byteRows(noiseSample_, L"수신");
+        match = examine(noiseSample_, noiseBytes_, 0, false, noiseAt_);
+    } else if (detailOpen()) {
+        match.evidence = rawEvidence(noiseSample_, noiseBytes_);
     }
     markDamaged(match.number);
     if (match.number) text += L". " + match.summary;
+    else if (match.skipped) text += L". 송·수신 대조 생략 (수신 처리 시간 상한)";
     fail(match.number, text, noiseAt_, true, 1, std::move(match.evidence));
     noiseBytes_ = 0;
     noiseSample_.clear();
@@ -509,45 +529,65 @@ void LoopbackTest::flushNoise()
 LoopbackTest::Comparison LoopbackTest::compare(const Buffer& received, std::uint64_t total, std::uint64_t hint,
                                                bool trustHint, Clock::time_point at)
 {
-    const std::size_t used = (std::min)(received.size(), kCompareBytes);
+    const std::size_t used = (std::min)(received.size(), compareLimit_);
     compareGot_.assign(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(used));
     const std::wstring sizes = grouped(total) + L" Byte" + (used < total ? L" 중 앞 " + grouped(used) + L" Byte" : std::wstring());
     const std::uint64_t sent = state_.sent;
-    const std::uint64_t span = (std::min)(sent, (std::min)(settings_.replyWindow + kCompareMargin, kCompareSpan));
+    // window: 대응 가능 범위(회신 허용 시퀀스 + 여유). span: 후보 선별 범위(장문 전문은 재구성 비용 상한 적용)
+    const std::uint64_t window = (std::min)(sent, (std::min)(settings_.replyWindow + kCompareMargin, kCompareSpan));
+    const std::uint64_t span = (std::min)(window, std::uint64_t{kScanBytes / maxFrame_});
     const auto rebuild = [this](std::uint64_t number) {
-        buildFrame(Frame{static_cast<std::uint16_t>(number - 1), slotOf(number).data}, compareSent_);
+        compareFrame_.sequence = static_cast<std::uint16_t>(number - 1);
+        frameData(dataKey_, number, compareFrame_.data.data(), compareFrame_.data.size());
+        buildFrame(compareFrame_, compareSent_);
     };
 
     // 후보 선별: 최근 송신 전문 중 위치 대응 일치 상위 후보. 동률 시 최근 전문 우선
     std::array<std::uint64_t, kFinalists> top{};
     std::array<std::size_t, kFinalists> scores{};
+    std::array<std::size_t, kFinalists> commons{};
     for (std::uint64_t back = 0; back < span; ++back) {
         const std::uint64_t number = sent - back;
         if (slotOf(number).number != number) continue;
         rebuild(number);
         const std::size_t score = wireAffinity(compareSent_, compareGot_);
+        const std::size_t common = (std::min)(compareSent_.size(), compareGot_.size());
         for (std::size_t i = 0; i < top.size(); ++i) {
             if (top[i] && score <= scores[i]) continue;
             for (std::size_t k = top.size() - 1; k > i; --k) {
                 top[k] = top[k - 1];
                 scores[k] = scores[k - 1];
+                commons[k] = commons[k - 1];
             }
             top[i] = number;
             scores[i] = score;
+            commons[i] = common;
             break;
         }
     }
+    // 장문 전문 대조: 위치 대응 일치가 우연 수준(공통 길이의 2/256 + 구조 바이트)인 후보는 정렬 생략
+    // 짧은 수신 조각은 길이 1/4(최소 4B) 하한. 시퀀스 해당 후보도 동일 적용(정상 CRC 전문 제외)
+    const auto plausible = [this](std::size_t score, std::size_t common) {
+        return maxFrame_ < kCheapFrame || score >= (std::min)(16 + common / 64, (std::max)(std::size_t{4}, common / 4));
+    };
 
     // 정렬 대조: 상이 최소, 동률 시 연속 일치 DATA·CRC 다수
     const bool hintValid = hint && hint <= sent && slotOf(hint).number == hint;
-    const bool hintRecent = hintValid && sent - hint < span;
+    const bool hintRecent = hintValid && sent - hint < window;
     std::uint64_t bestNumber = 0;
     WireDiff best;
     WireDiff hinted;
+    bool hintAligned = false;
     const auto consider = [&](std::uint64_t number) {
         rebuild(number);
+        if (number == hint && !trustHint &&
+            !plausible(wireAffinity(compareSent_, compareGot_), (std::min)(compareSent_.size(), compareGot_.size())))
+            return;
         WireDiff diff = alignWire(compareSent_, compareGot_);
-        if (number == hint) hinted = diff;
+        if (number == hint) {
+            hinted = diff;
+            hintAligned = true;
+        }
         if (!bestNumber || diff.errors() < best.errors() ||
             (diff.errors() == best.errors() && diff.anchored > best.anchored)) {
             best = std::move(diff);
@@ -555,12 +595,14 @@ LoopbackTest::Comparison LoopbackTest::compare(const Buffer& received, std::uint
         }
     };
     if (hintValid) consider(hint);
-    for (const std::uint64_t number : top)
-        if (number && number != hint) consider(number);
+    for (std::size_t i = 0; i < top.size(); ++i)
+        if (top[i] && top[i] != hint && plausible(scores[i], commons[i])) consider(top[i]);
 
-    // 대응 인정: 연속 일치 구간 내 DATA·CRC 4B 이상. 최근 송신 전문과 시퀀스 일치 시 1B 이상(선두 절단 전문)
+    // 대응 인정: 연속 일치 구간 내 DATA·CRC가 하한(4B, DATA 1~2B 전문은 DATA 길이 + 1) 이상
+    // 최근 송신 전문과 시퀀스 일치 시 1B 이상(선두 절단 전문)
+    const std::size_t minAnchored = (std::min)(kMinAnchored, settings_.dataSize + 1);
     const auto accepted = [&](std::uint64_t number, const WireDiff& diff) {
-        return number && (diff.anchored >= kMinAnchored || (number == hint && hintRecent && diff.anchored > 0));
+        return number && (diff.anchored >= minAnchored || (number == hint && hintRecent && diff.anchored > 0));
     };
     std::uint64_t chosen = 0;
     const WireDiff* diff = nullptr;
@@ -571,14 +613,14 @@ LoopbackTest::Comparison LoopbackTest::compare(const Buffer& received, std::uint
     } else if (accepted(bestNumber, best)) {
         chosen = bestNumber;
         diff = &best;
-    } else if (hintValid && accepted(hint, hinted)) {
+    } else if (hintAligned && accepted(hint, hinted)) {
         chosen = hint;
         diff = &hinted;
     }
 
     Comparison result;
     if (!chosen) {
-        result.evidence = L"수신 원문 " + sizes + L"\r\n" + byteRows(compareGot_, L"수신");
+        result.evidence = rawEvidence(compareGot_, total);
         return result;
     }
     rebuild(chosen);
@@ -603,6 +645,31 @@ LoopbackTest::Comparison LoopbackTest::compare(const Buffer& received, std::uint
         if (items.size() > kEvidenceItems) result.evidence += L"\r\n  외 " + grouped(items.size() - kEvidenceItems) + L"건";
     }
     return result;
+}
+
+LoopbackTest::Comparison LoopbackTest::examine(const Buffer& received, std::uint64_t total, std::uint64_t hint,
+                                               bool trustHint, Clock::time_point at)
+{
+    Comparison result;
+    if (!detailOpen()) return result;
+    if (Clock::now() < compareUntil_) return compare(received, total, hint, trustHint, at);
+    result.skipped = true;
+    result.evidence = rawEvidence(received, total);
+    return result;
+}
+
+bool LoopbackTest::dataMatches(std::uint64_t number, const Buffer& data)
+{
+    if (data.size() != expected_.size()) return false;
+    frameData(dataKey_, number, expected_.data(), expected_.size());
+    return std::equal(data.begin(), data.end(), expected_.begin());
+}
+
+std::wstring LoopbackTest::rawEvidence(const Buffer& bytes, std::uint64_t total) const
+{
+    const std::size_t shown = (std::min)(bytes.size(), kRawShown);
+    return L"수신 원문 " + grouped(total) + L" Byte" + (shown < total ? L" 중 앞 " + grouped(shown) + L" Byte" : std::wstring()) +
+           L"\r\n" + byteRows(bytes.data(), shown, L"수신");
 }
 
 void LoopbackTest::markDamaged(std::uint64_t number)

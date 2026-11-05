@@ -29,6 +29,9 @@
 #define IDC_INTERVAL_LABEL          1025
 #define IDC_SEND_INTERVAL           1026
 #define IDC_INTERVAL_UNIT           1027
+#define IDC_DATA_LABEL              1028
+#define IDC_DATA_SIZE               1029
+#define IDC_DATA_UNIT               1031
 
 #define IDC_CHANNEL_LIST            1030
 

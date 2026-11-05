@@ -25,7 +25,7 @@ constexpr DWORD kConnectTimeoutMs = 3000;  // TCP 접속 대기 상한. UI 스�
 constexpr DWORD kSerialQueueBytes = 65536; // 직렬 드라이버 송·수신 대기열 권고치. 작업 스레드 지연 시 수신 초과 방지
 constexpr DWORD kIoGuardMs = 20;         // 대기 상한(COMMTIMEOUTS) 미준수 드라이버 대비 자체 대기 여유. 준수 드라이버 자체 만료 우선
 constexpr Byte kUnfilled = 0x5A;         // 수신 버퍼 미기록 판별 표지
-constexpr std::size_t kEchoProbeBytes = 8;  // 송신 반향 확정 최소 일치 바이트. STX·시퀀스 외 DATA 5바이트 이상
+constexpr std::size_t kEchoProbeBytes = 8;  // 송신 반향 확정 최소 일치 바이트. 전문 선두 8B(DATA 5B 미만 전문은 CRC·FF 포함)
 constexpr int   kSocketBufferBytes = 262144;  // 소켓 수신 버퍼. 작업 스레드 지연 구간 데이터그램 보존
 constexpr std::size_t kReceiveBurstBytes = 65536;     // receive 1회 수용 상한. 연속 유입 시 송신 주기 처리 기회 보장
 constexpr std::size_t kReceiveBurstDatagrams = 1024;  // UDP receive 1회 수용 데이터그램 상한
@@ -322,6 +322,12 @@ public:
     }
 
     std::wstring notice() const override { return notice_; }
+
+    // 흐름 제어 정체 등 장기 송신 대기 중 시험 중지 지연 방지. 미진행 시 무동작
+    void abortSend() override
+    {
+        if (handle_ != INVALID_HANDLE_VALUE) CancelIoEx(handle_, &writeIo_);
+    }
 
 private:
     // 비동기 수신 개시 후 완료 대기. 대기 상한 + 여유 경과 시 자체 취소(취소 전 기록분 유지)
@@ -741,7 +747,8 @@ public:
     bool receive(Buffer& inOut, std::chrono::milliseconds wait, std::wstring& error) override
     {
         if (!awaitReadable(socket_, wait, L"UDP 수신 대기 실패", error)) return false;
-        std::array<Byte, 2048> chunk{};
+        // 데이터그램 1건 수용: DATA 길이 상한 기준 최대 전문(2,060B) 이상
+        std::array<Byte, 8192> chunk{};
         for (std::size_t datagrams = 0; datagrams < kReceiveBurstDatagrams; ++datagrams) {
             sockaddr_in from{};
             int fromLength = sizeof(from);

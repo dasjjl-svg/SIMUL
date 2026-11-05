@@ -25,6 +25,7 @@ struct TestSettings {
     std::chrono::milliseconds interval{50};       // 송신 주기(기본 50ms)
     // 회신 허용 시퀀스 수: 후속 전문 replyWindow건 송신 시점까지 미회신이면 이상
     std::uint32_t replyWindow = 5;
+    std::size_t dataSize = DATA_SIZE;             // DATA 길이(1~1024 Byte)
 };
 
 struct TestEvent {
@@ -91,12 +92,11 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
 
-    // 송신 전문 상태. 시퀀스 값으로 직접 색인(시퀀스 1순환분)
+    // 송신 전문 상태. 시퀀스 값으로 직접 색인(시퀀스 1순환분). DATA는 키·전문 번호로 재생성
     struct Slot {
-        std::uint64_t number = 0;    // 전문 번호(1부터). 0: 미사용
-        Data data{};
+        std::uint64_t number = 0;     // 전문 번호(1부터). 0: 미사용
         Clock::time_point sentAt{};
-        std::uint8_t wireBytes = 0;  // DLE 치환 후 회선상 전문 길이
+        std::uint16_t wireBytes = 0;  // DLE 치환 후 회선상 전문 길이
         bool answered = false;
         bool lost = false;           // 회신 기한 경과 미회신(이상 처리 완료)
         bool localEchoSeen = false;
@@ -107,6 +107,7 @@ private:
         std::uint64_t number = 0;  // 대응 송신 전문 번호. 0: 특정 불가
         std::wstring summary;      // 상이 요약. 대응 전문 특정 시에만
         std::wstring evidence;     // 송·수신 대조표 또는 수신 원문(기록 파일 전용)
+        bool skipped = false;      // 수신 처리 1회당 대조 시간 상한 도달로 대조 생략
     };
 
     void run();
@@ -115,7 +116,11 @@ private:
     void finish(const std::wstring& abortReason);
 
     // 이하 mutex_ 보유 상태 호출 전제
-    void record(std::uint64_t number, const Frame& frame, std::size_t wireBytes, Clock::time_point at);
+    void record(std::uint64_t number, std::size_t wireBytes, Clock::time_point at);
+    // 수신 DATA와 해당 전문 송신 DATA(재생성) 일치 여부
+    bool dataMatches(std::uint64_t number, const Buffer& data);
+    // 수신 원문 기록(앞 256B). total: 실제 길이
+    std::wstring rawEvidence(const Buffer& bytes, std::uint64_t total) const;
     void handleFrame(const ParseResult& parsed, const Frame& got, Clock::time_point at);
     void flushNoise();  // 누적 전문 외 수신 1건 계수
     // 수신 회선 바이트(total: 실제 길이)의 대응 송신 전문 추정·대조. hint: 수신 시퀀스 해당 전문 번호(0: 없음)
@@ -123,6 +128,11 @@ private:
     Comparison compare(const Buffer& received, std::uint64_t total, std::uint64_t hint, bool trustHint,
                        Clock::time_point at);
     void markDamaged(std::uint64_t number);
+    // 상세 기록 가능 여부(화면·기록 파일 상한 미도달). 상한 도달 후 대조 생략
+    bool detailOpen() const { return loggedFailures_ < detailLogLimit || filedFailures_ < fileDetailLimit; }
+    // 대조 또는 대조 생략 기록. 수신 처리 1회당 대조 시간 상한 도달 시 수신 원문만 기록(송신 주기·화면 갱신 보호)
+    Comparison examine(const Buffer& received, std::uint64_t total, std::uint64_t hint, bool trustHint,
+                       Clock::time_point at);
     // 후속 전문 latest번까지 송신 기준 회신 기한 경과 전문 이상 처리
     void expireThrough(std::uint64_t latest, Clock::time_point now);
     // 미회신 부가 정보: 손상 회신·송신 반향 수신 여부
@@ -174,6 +184,12 @@ private:
     Buffer noiseSample_;  // 계수 전 전문 외 수신 바이트(앞부분, 용량 한도)
     Buffer compareSent_;  // 대응 후보 송신 전문 재구성
     Buffer compareGot_;   // 대조 대상 수신 바이트
+    Frame rxFrame_;       // 수신 전문 해석 결과
+    Frame compareFrame_;  // 대응 후보 송신 전문(DATA 재생성)
+    Buffer expected_;     // 회신 대조용 송신 DATA 재생성
+    std::uint64_t dataKey_ = 0;               // 시험별 DATA 생성 키
+    std::size_t maxFrame_ = maxFrameSize(DATA_SIZE);  // DATA 길이 기준 회선 최대 전문 길이
+    std::size_t compareLimit_ = maxFrame_ * 2;        // 대조 대상 수신 바이트 상한
     std::size_t lane_ = 0;
     Clock::time_point startedAt_{};
     bool halfDuplex_ = false;          // RS-485 2선식
@@ -185,6 +201,8 @@ private:
     std::uint64_t noiseBytes_ = 0;     // 계수 전 연속 전문 외 수신 바이트
     Clock::time_point noiseAt_{};      // 해당 잡음 최초 수신 시각
     double charMicros_ = 0.0;          // 직렬 문자 1개 선로 시간(us)
+    Clock::duration compareBudget_{};  // 수신 처리 1회당 대조 시간 상한: 송신 주기 1/4(2~10ms)
+    Clock::time_point compareUntil_{}; // 현재 수신 처리의 대조 허용 시한
 };
 
 }  // namespace loopback

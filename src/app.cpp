@@ -47,8 +47,13 @@ constexpr unsigned long long kMaxInterval = 10000;
 constexpr const wchar_t* kDefaultInterval = L"50";
 constexpr unsigned long long kSteadyInterval = 20;    // 미만 송신 주기는 PC 부하 시 주기 이탈 판정 가능
 constexpr unsigned long long kMaxHours = 72;
-// 평균 전문 길이: 고정 40B + DATA·CRC 34B의 DLE 치환 기대치 0.4B
-constexpr double kMeanFrameBytes = 40.4;
+constexpr const wchar_t* kDefaultData = L"32";        // DATA 길이 범위: MIN_DATA_SIZE~MAX_DATA_SIZE Byte
+
+// 평균 전문 길이: STX·FF FF·ETX 4B + 시퀀스·DATA·CRC(DATA 길이 + 4B)의 DLE 치환 기대치(바이트당 3/256 확률 1B 추가)
+double meanFrameBytes(std::size_t dataSize)
+{
+    return 4.0 + static_cast<double>(dataSize + 4) * (1.0 + 3.0 / 256.0);
+}
 
 enum TransportIndex { kSerial = 0, kTcp = 1, kUdp = 2 };
 enum StandardIndex { kRs232 = 0, kRs422 = 1, kRs485TwoWire = 2, kRs485FourWire = 3 };
@@ -119,14 +124,15 @@ constexpr int kUdpControls[] = {IDC_UDP_LOCAL_LABEL, IDC_UDP_LOCAL_HOST, IDC_UDP
                                 IDC_UDP_REMOTE_LABEL, IDC_UDP_REMOTE_HOST, IDC_UDP_REMOTE_PORT_LABEL,
                                 IDC_UDP_REMOTE_PORT};
 constexpr int kInputControls[] = {IDC_CHANNEL_COUNT, IDC_CHANNEL_COUNT_SPIN, IDC_ECHO_TIMEOUT, IDC_SEND_INTERVAL,
-                                  IDC_DURATION_HOURS,
+                                  IDC_DATA_SIZE, IDC_DURATION_HOURS,
                                   IDC_DURATION_HOURS_SPIN, IDC_DURATION_MINUTES, IDC_DURATION_MINUTES_SPIN,
                                   IDC_TRANSPORT_COMBO, IDC_SERIAL_STANDARD, IDC_SERIAL_PORT, IDC_SERIAL_REFRESH,
                                   IDC_SERIAL_BAUD, IDC_SERIAL_DATA, IDC_SERIAL_PARITY, IDC_SERIAL_STOP,
                                   IDC_SERIAL_FLOW, IDC_SERIAL_ECHO, IDC_TCP_HOST, IDC_TCP_PORT, IDC_UDP_LOCAL_HOST,
                                   IDC_UDP_LOCAL_PORT, IDC_UDP_REMOTE_HOST, IDC_UDP_REMOTE_PORT};
 constexpr int kMutedLabels[] = {IDC_CHANNEL_SUMMARY, IDC_SERIAL_BAUD_UNIT, IDC_SERIAL_ECHO_HINT,
-                                IDC_DURATION_HOURS_UNIT, IDC_DURATION_MINUTES_UNIT, IDC_ECHO_UNIT, IDC_INTERVAL_UNIT};
+                                IDC_DURATION_HOURS_UNIT, IDC_DURATION_MINUTES_UNIT, IDC_ECHO_UNIT, IDC_INTERVAL_UNIT,
+                                IDC_DATA_UNIT};
 constexpr int kSections[] = {IDC_SECTION_TEST, IDC_SECTION_CHANNELS, IDC_SECTION_EDITOR, IDC_SECTION_LOG};
 
 template <std::size_t N>
@@ -593,10 +599,12 @@ void App::onInit()
     SendDlgItemMessageW(dialog_, IDC_DURATION_MINUTES_SPIN, UDM_SETPOS32, 0, 0);
     SetDlgItemTextW(dialog_, IDC_ECHO_TIMEOUT, kDefaultReplyWindow);
     SetDlgItemTextW(dialog_, IDC_SEND_INTERVAL, kDefaultInterval);
+    SetDlgItemTextW(dialog_, IDC_DATA_SIZE, kDefaultData);
 
     Edit_LimitText(item(IDC_CHANNEL_COUNT), 2);
     Edit_LimitText(item(IDC_ECHO_TIMEOUT), 4);
     Edit_LimitText(item(IDC_SEND_INTERVAL), 5);
+    Edit_LimitText(item(IDC_DATA_SIZE), 4);
     Edit_LimitText(item(IDC_DURATION_HOURS), 2);
     Edit_LimitText(item(IDC_DURATION_MINUTES), 2);
     ComboBox_LimitText(item(IDC_SERIAL_PORT), 11);
@@ -640,6 +648,7 @@ void App::onCommand(int id, int code)
         if (code == EN_CHANGE) conditionsChanged();
         break;
     case IDC_SEND_INTERVAL:
+    case IDC_DATA_SIZE:
         if (code == EN_CHANGE) {
             conditionsChanged();
             InvalidateRect(item(IDC_VERDICT), nullptr, FALSE);
@@ -935,7 +944,8 @@ void App::startTest()
     const TestSettings& first = plan.front().settings;
     appendLog(L"시험 시작. 사용 " + std::to_wstring(plan.size()) + L"채널 · 시험 시간 " +
               clockText(std::chrono::duration_cast<std::chrono::milliseconds>(duration_)) + L" · 송신 주기 " +
-              grouped(static_cast<std::uint64_t>(first.interval.count())) + L" ms · 회신 허용 시퀀스 " +
+              grouped(static_cast<std::uint64_t>(first.interval.count())) + L" ms · DATA " +
+              grouped(first.dataSize) + L" Byte · 회신 허용 시퀀스 " +
               grouped(first.replyWindow) + L"회 (" +
               grouped(static_cast<std::uint64_t>((first.interval * first.replyWindow).count())) + L" ms)");
     for (const Plan& entry : plan) {
@@ -1265,6 +1275,7 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
     unsigned long long minutes = 0;
     unsigned long long window = 0;
     unsigned long long interval = 0;
+    unsigned long long dataSize = 0;
     if (!parseNumber(trimmed(text(IDC_CHANNEL_COUNT)), kMaxChannels, count) || count != channelCount_) {
         error = L"채널 수 범위 오류. 1~32 지정.";
         field = IDC_CHANNEL_COUNT;
@@ -1296,6 +1307,11 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
         field = IDC_SEND_INTERVAL;
         return false;
     }
+    if (!parseNumber(trimmed(text(IDC_DATA_SIZE)), MAX_DATA_SIZE, dataSize) || dataSize < MIN_DATA_SIZE) {
+        error = L"DATA 길이 범위 오류. " + grouped(MIN_DATA_SIZE) + L"~" + grouped(MAX_DATA_SIZE) + L" Byte 지정.";
+        field = IDC_DATA_SIZE;
+        return false;
+    }
 
     plan.clear();
     for (std::size_t i = 0; i < channelCount_; ++i) {
@@ -1308,6 +1324,7 @@ bool App::readPlan(std::vector<Plan>& plan, std::wstring& error, int& channel, i
         entry.settings.duration = std::chrono::seconds(static_cast<long long>(seconds));
         entry.settings.interval = std::chrono::milliseconds(static_cast<long long>(interval));
         entry.settings.replyWindow = static_cast<std::uint32_t>(window);
+        entry.settings.dataSize = static_cast<std::size_t>(dataSize);
         plan.push_back(entry);
     }
 
@@ -1366,7 +1383,7 @@ std::wstring App::planWarnings(const std::vector<Plan>& plan) const
         const bool shared = serial.standard == SerialStandard::Rs485TwoWire;
         const double period = std::chrono::duration<double>(entry.settings.interval).count();
         const auto required =
-            static_cast<unsigned long long>(kMeanFrameBytes * bits / period * (shared ? 2.0 : 1.0)) + 1;
+            static_cast<unsigned long long>(meanFrameBytes(entry.settings.dataSize) * bits / period * (shared ? 2.0 : 1.0)) + 1;
         if (serial.baud < required)
             add(entry.channel, L"통신 속도 " + grouped(serial.baud) + L" bps. " +
                                    grouped(static_cast<std::uint64_t>(entry.settings.interval.count())) +
@@ -1405,6 +1422,8 @@ void App::loadSettings()
     if (readRegistryText(key, L"SendInterval", value) && parseNumber(value, kMaxInterval, number) &&
         number >= kMinInterval)
         SetDlgItemTextW(dialog_, IDC_SEND_INTERVAL, value.c_str());
+    if (readRegistryText(key, L"DataBytes", value) && parseNumber(value, MAX_DATA_SIZE, number) && number >= MIN_DATA_SIZE)
+        SetDlgItemTextW(dialog_, IDC_DATA_SIZE, value.c_str());
     if (readRegistryText(key, L"Maximized", value)) maximized_ = value != L"0";
     RegCloseKey(key);
 }
@@ -1420,6 +1439,7 @@ void App::saveSettings() const
     writeRegistryText(key, L"DurationMinutes", trimmed(text(IDC_DURATION_MINUTES)));
     writeRegistryText(key, L"ReplyWindow", trimmed(text(IDC_ECHO_TIMEOUT)));
     writeRegistryText(key, L"SendInterval", trimmed(text(IDC_SEND_INTERVAL)));
+    writeRegistryText(key, L"DataBytes", trimmed(text(IDC_DATA_SIZE)));
     writeRegistryText(key, L"Maximized", windowMaximized() ? L"1" : L"0");
     RegCloseKey(key);
 }
@@ -2055,10 +2075,13 @@ ui::VerdictView App::verdictView() const
         view.color = ui::palette::Idle;
         view.state = L"대기";
         unsigned long long interval = 0;
-        const bool valid = parseNumber(trimmed(text(IDC_SEND_INTERVAL)), kMaxInterval, interval) && interval >= kMinInterval;
+        unsigned long long dataSize = 0;
+        const bool timed = parseNumber(trimmed(text(IDC_SEND_INTERVAL)), kMaxInterval, interval) && interval >= kMinInterval;
+        const bool sized = parseNumber(trimmed(text(IDC_DATA_SIZE)), MAX_DATA_SIZE, dataSize) && dataSize >= MIN_DATA_SIZE;
         view.detail = L"사용 " + std::to_wstring(channelCount_) + L"채널 · 송신 주기 " +
-                      (valid ? grouped(interval) + L" ms" : std::wstring(L"확인 필요")) +
-                      L" · DATA 32 Byte · 시험 시간 최대 72시간";
+                      (timed ? grouped(interval) + L" ms" : std::wstring(L"확인 필요")) + L" · DATA " +
+                      (sized ? grouped(dataSize) + L" Byte" : std::wstring(L"길이 확인 필요")) +
+                      L" · 시험 시간 최대 72시간";
     } else if (result.failedChannels) {
         view.color = ui::palette::Fault;
         view.state = L"FAIL";
