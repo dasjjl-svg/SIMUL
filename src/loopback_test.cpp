@@ -23,6 +23,8 @@ constexpr std::size_t kMinAnchored = 4;        // 대응 인정 하한: 연속 �
 constexpr std::size_t kNoiseCompareMin = 8;    // 전문 외 수신의 송신 전문 대조 하한 길이
 constexpr std::size_t kSummaryItems = 3;       // 상이 요약 항목 상한
 constexpr std::size_t kEvidenceItems = 64;     // 대조표 상이 항목 상한
+// 송신 시각 통상 오차 상한: 수신 대기 ms 단위 올림 + 시스템 타이머 분해능(1ms)
+constexpr std::chrono::milliseconds kSendJitter{2};
 
 const wchar_t* describe(FrameError error)
 {
@@ -217,7 +219,7 @@ void LoopbackTest::run()
                 break;
             }
             draining = true;
-            // 잔여 회신 대기: 최종 전문 회신 기한(송신 시각 + 회신 허용 시퀀스 × 송신 주기)까지
+            // 잔여 회신 대기: 최종 전문 회신 기한(송신 주기 기준 후속 가상 시퀀스 replyWindow건)까지
             drainUntil = lastSentAt + settings_.interval * settings_.replyWindow;
             std::lock_guard<std::mutex> lock(mutex_);
             drainStarted_ = true;
@@ -255,13 +257,16 @@ void LoopbackTest::run()
             // 잡음 계수 단위 상한: 송신 주기 1회. 진행 중 단발 잡음 분할 방지 위해 1주기 이상 지속분만 확정
             if (noiseBytes_ && issued - noiseAt_ >= settings_.interval) flushNoise();
             record(number, txFrame_.size(), issued);
-            // 1주기 이상 지연 송신은 누락 주기 실패 계수 (절전·스케줄링 정지·회선 정체·송신 정체)
-            // 누락 주기는 시험 시간 내 예정분만 계수, 최소 1주기
+            // 송신 지연: 예정 송신 시각 대비. 최대값은 PC·드라이버 측 지연 지표
             const auto slot = nextTx;
             const auto lateness = issued - slot;
-            nextTx += settings_.interval;
             const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(lateness);
             if (delay > state_.maxSendDelay) state_.maxSendDelay = delay;
+            // 지연 송신 시 이후 송신 일정을 통상 오차 초과분만큼 이동: 연속 전문 송신 간격 하한 = 송신 주기 - 통상 오차
+            // 후속 전문 송신 시점 기준 회신 판정의 회신 허용 구간이 PC 측 지연으로 단축되는 것 방지
+            nextTx = (std::max)(slot + settings_.interval, issued + settings_.interval - kSendJitter);
+            // 1주기 이상 지연 송신은 누락 주기 실패 계수 (절전·스케줄링 정지·회선 정체·송신 정체)
+            // 누락 주기는 시험 시간 내 예정분만 계수, 최소 1주기
             if (lateness >= settings_.interval) {
                 const auto skipped = static_cast<std::uint64_t>(lateness / settings_.interval);
                 const auto window = slot + settings_.interval < deadline
@@ -275,16 +280,19 @@ void LoopbackTest::run()
             }
         }
 
-        // 다음 처리 시각(송신 주기·회신 기한·잔여 회신 대기 종료·정적 확인)까지 수신 대기. 주기 폴링 배제
+        // 다음 처리 시각(송신 주기·가상 시퀀스 기한·잔여 회신 대기 종료·정적 확인)까지 수신 대기. 주기 폴링 배제
         auto wake = Clock::now() + idleWait;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto current = Clock::now();
-            // 회신 기한 도래 시각 기상: 기한 경과 후 도착분의 정상 반영 배제
-            if (outstanding_) wake = (std::min)(wake, nextDeadline());
-            if (!draining) wake = (std::min)(wake, nextTx);
-            else if (current < drainUntil) wake = (std::min)(wake, drainUntil);
-            else wake = (std::min)(wake, drainUntil + drainGrace_);
+            if (!draining) {
+                wake = (std::min)(wake, nextTx);
+            } else if (current < drainUntil) {
+                const auto elapsedSlots = (current - lastSentAt) / settings_.interval;
+                wake = (std::min)({wake, drainUntil, lastSentAt + settings_.interval * (elapsedSlots + 1)});
+            } else {
+                wake = (std::min)(wake, drainUntil + drainGrace_);
+            }
             // 정적 구간 도래 시각: 잡음 1회 확정, 잔여 회신 대기 종료 판정
             const auto quietAt = lastRxAt + settleWait_;
             if (quietAt > current && (noiseBytes_ || (draining && (!outstanding_ || current >= drainUntil))))
@@ -314,6 +322,9 @@ void LoopbackTest::run()
                      at, true, fault.count);
             }
             compareUntil_ = at + compareBudget_;
+            // 잔여 회신 대기 중 회신 기한: 최종 송신 이후 송신 주기 경과 수를 가상 시퀀스로 적용. 수신분 해석 전 기한 확정
+            if (draining && number)
+                expireThrough(number + static_cast<std::uint64_t>((at - lastSentAt) / settings_.interval), at);
             // 치명 오류 시에도 동일 호출에서 수신 완료된 전문은 판정 반영
             for (;;) {
                 const ParseResult parsed =
@@ -321,8 +332,6 @@ void LoopbackTest::run()
                 handleFrame(parsed, rxFrame_, at);
                 if (parsed.status == Parse::NeedMore) break;
             }
-            // 수신 완료분 판정 후 기한 경과 전문 처리. 기한 시각 기상으로 기한 후 도착분은 별도 수신 처리에서 지연 판정
-            expireDue(at);
             // 정적 구간 경과 시 잡음 1회 발생 확정. 수신 분할 단위와 무관
             if (noiseBytes_ && at - lastRxAt >= settleWait_) flushNoise();
             summarize(at);
@@ -365,7 +374,7 @@ void LoopbackTest::finish(const std::wstring& abortReason)
     const bool waitStopped = !aborted && !completed_ && (drainStarted_ || end >= startedAt_ + settings_.duration);
     const bool cancelled = !aborted && !completed_ && !waitStopped;
     // 잔여 회신 대기 종료: 전 전문 회신 기한 도래
-    if (completed_) expireDue(end, true);
+    if (completed_) expireThrough(state_.sent + settings_.replyWindow, end);
     const std::uint64_t unresolved = outstanding_;
     // 잔여 회신 대기 종료 시점 미완결 수신은 전문 절단 이상
     if (completed_ && !rxBuffer_.empty())
@@ -417,6 +426,7 @@ void LoopbackTest::record(std::uint64_t number, std::size_t wireBytes, Clock::ti
     slot.sentAt = at;
     slot.wireBytes = static_cast<std::uint16_t>(wireBytes);
     ++outstanding_;
+    expireThrough(number, at);
 }
 
 void LoopbackTest::handleFrame(const ParseResult& parsed, const Frame& got, Clock::time_point at)
@@ -676,37 +686,15 @@ void LoopbackTest::markDamaged(std::uint64_t number)
     if (slot.number == number && !slot.answered && !slot.lost) slot.damaged = true;
 }
 
-void LoopbackTest::expireDue(Clock::time_point now, bool all)
+void LoopbackTest::expireThrough(std::uint64_t latest, Clock::time_point now)
 {
-    for (; expireCursor_ <= state_.sent; ++expireCursor_) {
+    for (; expireCursor_ + settings_.replyWindow <= latest; ++expireCursor_) {
         Slot& slot = slotOf(expireCursor_);
         if (slot.number != expireCursor_ || slot.answered || slot.lost) continue;
-        // 기한 단조 증가: 첫 기한 미도래 전문 이후 전문도 미도래
-        if (!all && now < deadlineOf(slot)) break;
         slot.lost = true;
         --outstanding_;
         fail(slot.number, L"미회신 (시퀀스 " + grouped(settings_.replyWindow) + L"회 경과)" + missHint(slot), now);
     }
-}
-
-LoopbackTest::Clock::time_point LoopbackTest::nextDeadline()
-{
-    for (; expireCursor_ <= state_.sent; ++expireCursor_) {
-        const Slot& slot = slotOf(expireCursor_);
-        if (slot.number == expireCursor_ && !slot.answered && !slot.lost) return deadlineOf(slot);
-    }
-    return Clock::time_point::max();
-}
-
-LoopbackTest::Clock::time_point LoopbackTest::deadlineOf(const Slot& slot) const
-{
-    const auto byTime = slot.sentAt + settings_.interval * settings_.replyWindow;
-    const std::uint64_t follower = slot.number + settings_.replyWindow;
-    if (follower <= state_.sent) return (std::max)(byTime, slotOf(follower).sentAt);
-    if (!drainStarted_) return Clock::time_point::max();
-    // 잔여 회신 대기: 최종 송신 이후 송신 주기 간격 가상 송신
-    return (std::max)(byTime, slotOf(state_.sent).sentAt +
-                                   settings_.interval * static_cast<long long>(follower - state_.sent));
 }
 
 std::wstring LoopbackTest::missHint(const Slot& slot) const
