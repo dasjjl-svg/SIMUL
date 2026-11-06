@@ -1019,7 +1019,8 @@ void App::finishTest()
                           grouped(view.received) + L"건 · 정상 회신 " + grouped(view.matched) + L"건 · 이상 " +
                           grouped(view.failed) + L"건 · 지연 회신 " + grouped(view.late) + L"건 · 최대 지연 " +
                           (view.matched ? msText(view.maxLatency) : std::wstring(L"—")) + L" · 평균 지연 " +
-                          (view.matched ? msText(view.meanLatency) : std::wstring(L"—")),
+                          (view.matched ? msText(view.meanLatency) : std::wstring(L"—")) + L" · 최대 송신 지연 " +
+                          (view.sent ? msText(view.maxSendDelay) : std::wstring(L"—")),
                       now, {}, false);
         }
         if (logFile_ != INVALID_HANDLE_VALUE) appendLog(L"기록 파일 저장. " + logPath_);
@@ -2117,12 +2118,31 @@ std::wstring App::channelDetail() const
     const std::wstring latency = view.matched
                                      ? L"최대 지연 " + msText(view.maxLatency) + L" · 평균 " + msText(view.meanLatency)
                                      : std::wstring(L"정상 회신 없음");
-    // 회신 허용 시퀀스 경과 후 도착 건수(해당 전문은 미회신 이상)
+    // 회신 기한 경과 후 도착 건수(해당 전문은 미회신 이상)
     const std::wstring lateness = view.late ? L" · 지연 회신 " + grouped(view.late) + L"건" : std::wstring();
+    const std::wstring summary = name + L"수신 " + grouped(view.received) + L"건 · " + latency + lateness;
+    // 송신 지연: 예정 송신 시각 대비 PC 측 최대 지연. 1행 폭 초과 시 별도 행(항목 중간 줄바꿈 방지)
+    const std::wstring sendDelay = L"최대 송신 지연 " + (view.sent ? msText(view.maxSendDelay) : std::wstring(L"—"));
+    const std::wstring joined = summary + L" · " + sendDelay;
     const std::wstring failure = !view.abortReason.empty() ? L"시험 중단 · " + view.abortReason
                                  : view.hasFailure ? L"최초 이상 " + clockText(view.firstFailureAt, true) + L" · " + view.firstFailure
                                                    : std::wstring(L"이상 없음");
-    return name + L"수신 " + grouped(view.received) + L"건 · " + latency + lateness + L"\n" + failure;
+    return (fitsDetailLine(joined) ? joined : summary + L"\n" + sendDelay) + L"\n" + failure;
+}
+
+bool App::fitsDetailLine(const std::wstring& text) const
+{
+    const HWND control = item(IDC_CHANNEL_DETAIL);
+    RECT client{};
+    if (!control || !GetClientRect(control, &client)) return true;
+    const HDC dc = GetDC(control);
+    if (!dc) return true;
+    const HGDIOBJ oldFont = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(control, WM_GETFONT, 0, 0)));
+    SIZE size{};
+    const BOOL measured = GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
+    SelectObject(dc, oldFont);
+    ReleaseDC(control, dc);
+    return !measured || size.cx <= client.right;
 }
 
 int App::dluToPixels(int units) const

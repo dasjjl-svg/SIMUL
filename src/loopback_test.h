@@ -23,7 +23,7 @@ struct TestSettings {
     TransportConfig transport;
     std::chrono::seconds duration = std::chrono::hours(1);
     std::chrono::milliseconds interval{50};       // 송신 주기(기본 50ms)
-    // 회신 허용 시퀀스 수: 후속 전문 replyWindow건 송신 시점까지 미회신이면 이상
+    // 회신 허용 시퀀스 수: 송신 후 replyWindow × 송신 주기 경과 및 후속 전문 replyWindow건 송신 시점까지 미회신이면 이상
     std::uint32_t replyWindow = 5;
     std::size_t dataSize = DATA_SIZE;             // DATA 길이(1~1024 Byte)
 };
@@ -41,10 +41,11 @@ struct TestSnapshot {
     std::uint64_t sent = 0;
     std::uint64_t received = 0;
     std::uint64_t matched = 0;
-    std::uint64_t late = 0;     // 회신 허용 시퀀스 경과 후 도착(해당 전문은 미회신 이상 처리 완료)
+    std::uint64_t late = 0;     // 회신 기한 경과 후 도착(해당 전문은 미회신 이상 처리 완료)
     std::uint64_t failed = 0;
     std::chrono::microseconds maxLatency{0};
     std::chrono::microseconds meanLatency{0};
+    std::chrono::microseconds maxSendDelay{0};  // 예정 송신 시각 대비 최대 송신 지연(PC·드라이버 측 지연 지표)
     std::chrono::milliseconds elapsed{0};
     std::chrono::seconds duration{0};
     bool hasFailure = false;
@@ -55,9 +56,12 @@ struct TestSnapshot {
 };
 
 // 채널별 반송 시험 엔진. 작업 스레드 1개가 송·수신 처리
-// 송신 전문별 판정: 후속 전문 replyWindow건(기본 5) 송신 전까지 시퀀스·DATA 일치 회신 시 정상. 도착 순서 무관
+// 송신 전문별 판정: 회신 기한 내 시퀀스·DATA 일치 회신 시 정상. 도착 순서 무관
+// 회신 기한: 자기 송신 시각 + 회신 허용 시퀀스(기본 5) × 송신 주기, 후속 전문 회신 허용 건째 송신 시각 중 늦은 시각
+//   지연 송신 전문의 기한 단축 배제, PC 측 정체로 후속 송신 지연 시 기한 연장
+//   잔여 회신 대기 중 미송신 후속 전문: 최종 송신 이후 송신 주기 간격 가상 송신 시각 적용
 // 기한 내 미회신은 이상. 기한 경과 후 도착분은 지연 회신 기록만 수행(이상 중복 계수 없음)
-// 시험 시간 종료 후 기한은 송신 주기 기준 가상 시퀀스로 판정
+// 수신 처리 시 수신 완료분 판정 후 기한 경과분 처리: PC 측 처리 지연 중 도착한 회신은 정상 반영
 // 수신 이상(전문 불량·대응 없는 전문·시퀀스 불일치·DATA 불일치·중복 회신·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 이상
 // 데이터 이상은 최근 송신 전문 중 대응 전문 추정 후 회선 바이트 대조(상이 위치·값·비트) 기록
 // RS-485 2선식 송신 반향 미발생 설정: 전문 선로 시간 1.5배(송·회신 합의 75%) 미만 사본 또는 송신 중 송신 전문 동일 바이트 수신은
@@ -133,8 +137,13 @@ private:
     // 대조 또는 대조 생략 기록. 수신 처리 1회당 대조 시간 상한 도달 시 수신 원문만 기록(송신 주기·화면 갱신 보호)
     Comparison examine(const Buffer& received, std::uint64_t total, std::uint64_t hint, bool trustHint,
                        Clock::time_point at);
-    // 후속 전문 latest번까지 송신 기준 회신 기한 경과 전문 이상 처리
-    void expireThrough(std::uint64_t latest, Clock::time_point now);
+    // 회신 기한 경과 전문 이상 처리. all: 기한 무관 전부(잔여 대기 종료)
+    void expireDue(Clock::time_point now, bool all = false);
+    // 미회신 최고(最古) 전문의 회신 기한. 미회신 전문 없음 또는 기한 미확정 시 time_point::max()
+    Clock::time_point nextDeadline();
+    // 전문 회신 기한. 잔여 회신 대기 전 후속 전문 미송신 시 미확정(time_point::max())
+    // 송신 시각 단조 증가로 전문 번호 순 기한도 단조 증가
+    Clock::time_point deadlineOf(const Slot& slot) const;
     // 미회신 부가 정보: 손상 회신·송신 반향 수신 여부
     std::wstring missHint(const Slot& slot) const;
     void fail(std::uint64_t number, const std::wstring& text, Clock::time_point at, bool log = true,
@@ -152,6 +161,7 @@ private:
     Clock::duration replyFloor(std::size_t wireBytes) const;
     // 시퀀스 = (전문 번호 - 1)의 하위 16비트
     Slot& slotOf(std::uint64_t number) { return slots_[static_cast<std::uint16_t>(number - 1)]; }
+    const Slot& slotOf(std::uint64_t number) const { return slots_[static_cast<std::uint16_t>(number - 1)]; }
 
     TestSettings settings_{};
     std::unique_ptr<Transport> transport_;

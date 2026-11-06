@@ -138,6 +138,8 @@ private:
     Overall overall() const;
     ui::VerdictView verdictView() const;
     std::wstring channelDetail() const;
+    // 채널 상세 1행 수용 여부(상세 표시 글꼴·폭 기준)
+    bool fitsDetailLine(const std::wstring& text) const;
     int dluToPixels(int units) const;
     HWND item(int id) const { return GetDlgItem(dialog_, id); }
     std::wstring text(int id) const;
