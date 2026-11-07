@@ -2118,7 +2118,7 @@ std::wstring App::channelDetail() const
     const std::wstring latency = view.matched
                                      ? L"최대 지연 " + msText(view.maxLatency) + L" · 평균 " + msText(view.meanLatency)
                                      : std::wstring(L"정상 회신 없음");
-    // 회신 기한 경과 후 도착 건수(해당 전문은 미회신 이상)
+    // 회신 허용 시퀀스 경과 후 도착 건수(해당 전문은 미회신 이상)
     const std::wstring lateness = view.late ? L" · 지연 회신 " + grouped(view.late) + L"건" : std::wstring();
     const std::wstring summary = name + L"수신 " + grouped(view.received) + L"건 · " + latency + lateness;
     // 송신 지연: 예정 송신 시각 대비 PC 측 최대 지연. 1행 폭 초과 시 별도 행(항목 중간 줄바꿈 방지)

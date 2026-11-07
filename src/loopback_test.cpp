@@ -225,8 +225,19 @@ void LoopbackTest::run()
             drainStarted_ = true;
         }
         if (draining) {
+            // 가상 송신 도래 시 실송신과 동일하게 수신 대기열 도착분 판정 후 미회신 처리
+            bool due = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                due = outstanding_ && now >= nextVirtualDue();
+            }
+            std::wstring failure;
+            if (due && collectReceived(&failure)) lastRxAt = Clock::now();
+            if (!failure.empty()) {
+                abortReason = L"수신 오류: " + failure;
+                break;
+            }
             std::lock_guard<std::mutex> lock(mutex_);
-            // 가상 송신 도래 전문 미회신 처리. 실송신과 동일하게 직전 수신 처리 완료분 판정 후 적용
             expireVirtual(now);
             const bool settled = now - lastRxAt >= settleWait_;
             // 잔여 회신 대기 종료: 미회신·미완결 수신 없이 정적 구간 경과, 또는 기한 경과
@@ -247,11 +258,24 @@ void LoopbackTest::run()
             hold = holdUntil(number + 1);
         }
         if (!draining && now >= nextTx && now >= hold) {
+            // 이전 전문 송신 완료 대기 후 수신 대기열 도착분 판정 반영
+            // 작업 스레드 정체·송신 완료 대기 중 도착한 회신의 미회신 처리 방지(후속 전문 송신 전 도착분은 기한 내 회신)
+            std::wstring error;
+            if (!transport_->flush(error)) {
+                if (cancel_.load()) break;
+                abortReason = L"송신 오류: " + error;
+                collectReceived();
+                break;
+            }
+            if (collectReceived(&error)) lastRxAt = Clock::now();
+            if (!error.empty()) {
+                abortReason = L"수신 오류: " + error;
+                break;
+            }
             ++number;
             frame.sequence = static_cast<std::uint16_t>(number - 1);
             frameData(dataKey_, number, frame.data.data(), frame.data.size());
             buildFrame(frame, txFrame_);
-            std::wstring error;
             const auto before = Clock::now();
             if (!transport_->send(txFrame_, error)) {
                 if (cancel_.load()) break;
@@ -348,10 +372,13 @@ void LoopbackTest::run()
     finish(abortReason);
 }
 
-void LoopbackTest::collectReceived()
+bool LoopbackTest::collectReceived(std::wstring* error)
 {
-    std::wstring ignored;
-    transport_->receive(rxBuffer_, std::chrono::milliseconds(0), ignored);
+    std::wstring failure;
+    const std::size_t buffered = rxBuffer_.size();
+    const bool ok = transport_->receive(rxBuffer_, std::chrono::milliseconds(0), failure);
+    const bool arrived = rxBuffer_.size() != buffered;
+    if (error) *error = ok ? std::wstring() : failure;
     const LineFault fault = transport_->takeFault();
     const auto at = Clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
@@ -364,6 +391,7 @@ void LoopbackTest::collectReceived()
         handleFrame(parsed, rxFrame_, at);
         if (parsed.status == Parse::NeedMore) break;
     }
+    return arrived;
 }
 
 void LoopbackTest::finish(const std::wstring& abortReason)
