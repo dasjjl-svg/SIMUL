@@ -23,7 +23,7 @@ constexpr std::size_t kMinAnchored = 4;        // 대응 인정 하한: 연속 �
 constexpr std::size_t kNoiseCompareMin = 8;    // 전문 외 수신의 송신 전문 대조 하한 길이
 constexpr std::size_t kSummaryItems = 3;       // 상이 요약 항목 상한
 constexpr std::size_t kEvidenceItems = 64;     // 대조표 상이 항목 상한
-// 송신 시각 통상 오차 상한: 수신 대기 ms 단위 올림 + 시스템 타이머 분해능(1ms)
+// 송신 시각 통상 오차 상한: 수신 대기 ms 단위 올림 + 시스템 타이머 분해능(1ms). 송신 보류 시한 여유(보류 누적 방지)
 constexpr std::chrono::milliseconds kSendJitter{2};
 
 const wchar_t* describe(FrameError error)
@@ -226,6 +226,8 @@ void LoopbackTest::run()
         }
         if (draining) {
             std::lock_guard<std::mutex> lock(mutex_);
+            // 가상 송신 도래 전문 미회신 처리. 실송신과 동일하게 직전 수신 처리 완료분 판정 후 적용
+            expireVirtual(now);
             const bool settled = now - lastRxAt >= settleWait_;
             // 잔여 회신 대기 종료: 미회신·미완결 수신 없이 정적 구간 경과, 또는 기한 경과
             // 기한 경과 시점 수신 진행 중 전문은 정적 구간 또는 완결 대기 상한까지 연장
@@ -237,7 +239,14 @@ void LoopbackTest::run()
             }
         }
 
+        // 송신 보류: 이번 송신으로 회신 판정되는 전문이 미회신이고 회신 허용 구간(통상 오차 제외) 미경과 시
+        // PC 측 지연 송신 전문의 회신 허용 구간 단축 방지. 해당 전문 회신 수신 시 즉시 송신
+        Clock::time_point hold = Clock::time_point::min();
         if (!draining && now >= nextTx) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            hold = holdUntil(number + 1);
+        }
+        if (!draining && now >= nextTx && now >= hold) {
             ++number;
             frame.sequence = static_cast<std::uint16_t>(number - 1);
             frameData(dataKey_, number, frame.data.data(), frame.data.size());
@@ -262,9 +271,7 @@ void LoopbackTest::run()
             const auto lateness = issued - slot;
             const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(lateness);
             if (delay > state_.maxSendDelay) state_.maxSendDelay = delay;
-            // 지연 송신 시 이후 송신 일정을 통상 오차 초과분만큼 이동: 연속 전문 송신 간격 하한 = 송신 주기 - 통상 오차
-            // 후속 전문 송신 시점 기준 회신 판정의 회신 허용 구간이 PC 측 지연으로 단축되는 것 방지
-            nextTx = (std::max)(slot + settings_.interval, issued + settings_.interval - kSendJitter);
+            nextTx += settings_.interval;
             // 1주기 이상 지연 송신은 누락 주기 실패 계수 (절전·스케줄링 정지·회선 정체·송신 정체)
             // 누락 주기는 시험 시간 내 예정분만 계수, 최소 1주기
             if (lateness >= settings_.interval) {
@@ -280,16 +287,15 @@ void LoopbackTest::run()
             }
         }
 
-        // 다음 처리 시각(송신 주기·가상 시퀀스 기한·잔여 회신 대기 종료·정적 확인)까지 수신 대기. 주기 폴링 배제
+        // 다음 처리 시각(송신 주기·송신 보류 시한·가상 송신·잔여 회신 대기 종료·정적 확인)까지 수신 대기. 주기 폴링 배제
         auto wake = Clock::now() + idleWait;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto current = Clock::now();
             if (!draining) {
-                wake = (std::min)(wake, nextTx);
+                wake = (std::min)(wake, (std::max)(nextTx, hold));
             } else if (current < drainUntil) {
-                const auto elapsedSlots = (current - lastSentAt) / settings_.interval;
-                wake = (std::min)({wake, drainUntil, lastSentAt + settings_.interval * (elapsedSlots + 1)});
+                wake = (std::min)({wake, drainUntil, nextVirtualDue()});
             } else {
                 wake = (std::min)(wake, drainUntil + drainGrace_);
             }
@@ -322,9 +328,6 @@ void LoopbackTest::run()
                      at, true, fault.count);
             }
             compareUntil_ = at + compareBudget_;
-            // 잔여 회신 대기 중 회신 기한: 최종 송신 이후 송신 주기 경과 수를 가상 시퀀스로 적용. 수신분 해석 전 기한 확정
-            if (draining && number)
-                expireThrough(number + static_cast<std::uint64_t>((at - lastSentAt) / settings_.interval), at);
             // 치명 오류 시에도 동일 호출에서 수신 완료된 전문은 판정 반영
             for (;;) {
                 const ParseResult parsed =
@@ -691,10 +694,52 @@ void LoopbackTest::expireThrough(std::uint64_t latest, Clock::time_point now)
     for (; expireCursor_ + settings_.replyWindow <= latest; ++expireCursor_) {
         Slot& slot = slotOf(expireCursor_);
         if (slot.number != expireCursor_ || slot.answered || slot.lost) continue;
-        slot.lost = true;
-        --outstanding_;
-        fail(slot.number, L"미회신 (시퀀스 " + grouped(settings_.replyWindow) + L"회 경과)" + missHint(slot), now);
+        lose(slot, now);
     }
+}
+
+void LoopbackTest::expireVirtual(Clock::time_point now)
+{
+    for (; expireCursor_ <= state_.sent; ++expireCursor_) {
+        Slot& slot = slotOf(expireCursor_);
+        if (slot.number != expireCursor_ || slot.answered || slot.lost) continue;
+        // 가상 판정 시각 단조 증가: 첫 미도래 전문 이후 전문도 미도래
+        if (now < virtualDue(slot)) break;
+        lose(slot, now);
+    }
+}
+
+LoopbackTest::Clock::time_point LoopbackTest::nextVirtualDue()
+{
+    for (; expireCursor_ <= state_.sent; ++expireCursor_) {
+        const Slot& slot = slotOf(expireCursor_);
+        if (slot.number == expireCursor_ && !slot.answered && !slot.lost) return virtualDue(slot);
+    }
+    return Clock::time_point::max();
+}
+
+LoopbackTest::Clock::time_point LoopbackTest::virtualDue(const Slot& slot) const
+{
+    const std::uint64_t last = state_.sent;
+    const auto ahead = static_cast<long long>(slot.number + settings_.replyWindow) - static_cast<long long>(last);
+    return (std::max)(slotOf(last).sentAt + settings_.interval * ahead,
+                      slot.sentAt + settings_.interval * settings_.replyWindow - kSendJitter);
+}
+
+LoopbackTest::Clock::time_point LoopbackTest::holdUntil(std::uint64_t number) const
+{
+    if (number <= settings_.replyWindow) return Clock::time_point::min();
+    const std::uint64_t judged = number - settings_.replyWindow;
+    const Slot& slot = slotOf(judged);
+    if (slot.number != judged || slot.answered || slot.lost) return Clock::time_point::min();
+    return slot.sentAt + settings_.interval * settings_.replyWindow - kSendJitter;
+}
+
+void LoopbackTest::lose(Slot& slot, Clock::time_point at)
+{
+    slot.lost = true;
+    --outstanding_;
+    fail(slot.number, L"미회신 (시퀀스 " + grouped(settings_.replyWindow) + L"회 경과)" + missHint(slot), at);
 }
 
 std::wstring LoopbackTest::missHint(const Slot& slot) const

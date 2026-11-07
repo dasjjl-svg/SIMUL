@@ -57,10 +57,11 @@ struct TestSnapshot {
 
 // 채널별 반송 시험 엔진. 작업 스레드 1개가 송·수신 처리
 // 송신 전문별 판정: 후속 전문 replyWindow건(기본 5) 송신 전까지 시퀀스·DATA 일치 회신 시 정상. 도착 순서 무관
-// 송신 일정: 송신 주기 간격 고정 시각. 지연 송신 시 이후 일정을 지연분(통상 오차 2ms 초과분)만큼 이동
-//   연속 전문 송신 간격 유지로 PC 측 지연에 의한 회신 허용 구간 단축 방지
+// 송신 일정: 송신 주기 간격 고정 시각. 송신으로 회신 판정되는 전문이 미회신이고
+//   송신 후 회신 허용 × 송신 주기(통상 오차 2ms 제외) 미경과 시 송신 보류, 회신 수신 즉시 송신
+//   PC 측 지연 송신에 의한 회신 허용 구간 단축 방지. 일정 자체는 불변(회선 정체 시 송신 주기 이탈 판정 유지)
 // 기한 내 미회신은 이상. 기한 경과 후 도착분은 지연 회신 기록만 수행(이상 중복 계수 없음)
-// 시험 시간 종료 후 기한은 송신 주기 기준 가상 시퀀스로 판정
+// 시험 시간 종료 후 기한은 송신 주기 기준 가상 시퀀스로 판정(송신 보류 규칙 동일 적용)
 // 수신 이상(전문 불량·대응 없는 전문·시퀀스 불일치·DATA 불일치·중복 회신·전문 외 바이트·회선 이상)과 송신 주기 이탈은 건별 이상
 // 데이터 이상은 최근 송신 전문 중 대응 전문 추정 후 회선 바이트 대조(상이 위치·값·비트) 기록
 // RS-485 2선식 송신 반향 미발생 설정: 전문 선로 시간 1.5배(송·회신 합의 75%) 미만 사본 또는 송신 중 송신 전문 동일 바이트 수신은
@@ -138,6 +139,17 @@ private:
                        Clock::time_point at);
     // 후속 전문 latest번까지 송신 기준 회신 기한 경과 전문 이상 처리
     void expireThrough(std::uint64_t latest, Clock::time_point now);
+    // 잔여 회신 대기 중 가상 판정 시각 도래 미회신 전문 이상 처리
+    void expireVirtual(Clock::time_point now);
+    // 잔여 회신 대기 중 미회신 최고(最古) 전문의 가상 판정 시각. 미회신 전문 없음 시 time_point::max()
+    Clock::time_point nextVirtualDue();
+    // 가상 판정 시각: 최종 송신 이후 송신 주기 간격 가상 송신(후속 회신 허용 건째)과 송신 보류 시한 중 늦은 시각
+    Clock::time_point virtualDue(const Slot& slot) const;
+    // 전문 number 송신 보류 시한: 회신 판정 대상 전문(number - 회신 허용) 미회신 시
+    // 해당 전문 송신 시각 + 회신 허용 × 송신 주기 - 통상 오차. 보류 불요 시 time_point::min()
+    Clock::time_point holdUntil(std::uint64_t number) const;
+    // 미회신 이상 처리
+    void lose(Slot& slot, Clock::time_point at);
     // 미회신 부가 정보: 손상 회신·송신 반향 수신 여부
     std::wstring missHint(const Slot& slot) const;
     void fail(std::uint64_t number, const std::wstring& text, Clock::time_point at, bool log = true,
@@ -155,6 +167,7 @@ private:
     Clock::duration replyFloor(std::size_t wireBytes) const;
     // 시퀀스 = (전문 번호 - 1)의 하위 16비트
     Slot& slotOf(std::uint64_t number) { return slots_[static_cast<std::uint16_t>(number - 1)]; }
+    const Slot& slotOf(std::uint64_t number) const { return slots_[static_cast<std::uint16_t>(number - 1)]; }
 
     TestSettings settings_{};
     std::unique_ptr<Transport> transport_;
