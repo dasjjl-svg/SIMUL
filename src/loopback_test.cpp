@@ -106,6 +106,7 @@ void LoopbackTest::begin(std::size_t lane)
         state_.duration = settings_.duration;
         // 시험 중 힙 할당 배제용 선확보: 시퀀스 1순환분 송신 전문 상태
         slots_.assign(SEQUENCE_SPACE, Slot{});
+        holdBase_.assign(static_cast<std::size_t>(settings_.replyWindow) + 1, Clock::time_point{});
         outstanding_ = 0;
         expireCursor_ = 1;
         events_.clear();
@@ -292,6 +293,9 @@ void LoopbackTest::run()
             record(number, txFrame_.size(), issued);
             // 송신 지연: 예정 송신 시각 대비. 최대값은 PC·드라이버 측 지연 지표
             const auto slot = nextTx;
+            // 송신 보류 기준 시각: 송신 시각. 보류 시한 경과 후 송신은 보류 시한 + 통상 오차 상한까지
+            // 보류 해제 지연(수신 대기 초과·정체)분의 후속 보류 누적 방지
+            holdBase_[number % holdBase_.size()] = hold > slot ? (std::min)(issued, hold + kSendJitter) : issued;
             const auto lateness = issued - slot;
             const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(lateness);
             if (delay > state_.maxSendDelay) state_.maxSendDelay = delay;
@@ -321,7 +325,8 @@ void LoopbackTest::run()
             } else if (current < drainUntil) {
                 wake = (std::min)({wake, drainUntil, nextVirtualDue()});
             } else {
-                wake = (std::min)(wake, drainUntil + drainGrace_);
+                // 최종 송신 완료 대기 등으로 기한 경과 시 미처리 가상 송신 즉시 판정
+                wake = (std::min)({wake, drainUntil + drainGrace_, nextVirtualDue()});
             }
             // 정적 구간 도래 시각: 잡음 1회 확정, 잔여 회신 대기 종료 판정
             const auto quietAt = lastRxAt + settleWait_;
@@ -760,7 +765,7 @@ LoopbackTest::Clock::time_point LoopbackTest::holdUntil(std::uint64_t number) co
     const std::uint64_t judged = number - settings_.replyWindow;
     const Slot& slot = slotOf(judged);
     if (slot.number != judged || slot.answered || slot.lost) return Clock::time_point::min();
-    return slot.sentAt + settings_.interval * settings_.replyWindow - kSendJitter;
+    return holdBase_[judged % holdBase_.size()] + settings_.interval * settings_.replyWindow - kSendJitter;
 }
 
 void LoopbackTest::lose(Slot& slot, Clock::time_point at)

@@ -148,7 +148,7 @@ private:
     // 가상 판정 시각: 최종 송신 이후 송신 주기 간격 가상 송신(후속 회신 허용 건째)과 송신 보류 시한 중 늦은 시각
     Clock::time_point virtualDue(const Slot& slot) const;
     // 전문 number 송신 보류 시한: 회신 판정 대상 전문(number - 회신 허용) 미회신 시
-    // 해당 전문 송신 시각 + 회신 허용 × 송신 주기 - 통상 오차. 보류 불요 시 time_point::min()
+    // 해당 전문 보류 기준 시각 + 회신 허용 × 송신 주기 - 통상 오차. 보류 불요 시 time_point::min()
     Clock::time_point holdUntil(std::uint64_t number) const;
     // 미회신 이상 처리
     void lose(Slot& slot, Clock::time_point at);
@@ -179,6 +179,8 @@ private:
     mutable std::mutex mutex_;
     TestSnapshot state_{};
     std::vector<Slot> slots_;          // 시퀀스 1순환분 송신 전문. 시험 시작 시 확보, 시험 중 추가 할당 없음
+    // 최근 송신 전문(회신 허용 + 1건) 송신 보류 기준 시각. 전문 번호 순환 색인. 시험 시작 시 확보
+    std::vector<Clock::time_point> holdBase_;
     std::uint64_t outstanding_ = 0;    // 미회신 전문 수
     std::uint64_t expireCursor_ = 1;   // 회신 기한 판정 대상 최고(最古) 전문 번호
     std::deque<TestEvent> events_;
